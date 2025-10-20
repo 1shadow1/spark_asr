@@ -97,6 +97,22 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
 
 ---
 
+## 使用示例
+
+- 小时版资源（默认最高准确率、仅打印最终文本）
+  - `python sauc_websocket_demo.py --file test.mp3 --resource-id volc.bigasr.sauc.duration --output-mode final`
+
+- 并发版资源（默认最高准确率、仅打印最终文本）
+  - `python sauc_websocket_demo.py --file test.mp3 --resource-id volc.bigasr.sauc.concurrent --output-mode final`
+
+- 打印所有服务端响应（调试用）
+  - `python sauc_websocket_demo.py --file test.mp3 --resource-id volc.bigasr.sauc.duration --output-mode all`
+
+- 可选：调整分包时长（例如 100ms）
+  - `python sauc_websocket_demo.py --file test.mp3 --seg-duration 100`
+
+---
+
 ## 发送协议与分包策略
 
 - 客户端完整请求（JSON + GZIP 压缩）先行发送，随后发送音频分包。

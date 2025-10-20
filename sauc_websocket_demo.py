@@ -506,6 +506,32 @@ class AsrWsClient:
             if self.conn:
                 await self.conn.close()
 
+# 提取最终文本的辅助函数
+def extract_final_text(payload_msg: Any) -> str:
+    try:
+        if not payload_msg:
+            return ""
+        if isinstance(payload_msg, dict):
+            # 常见结构：{'result': {'text': '...'}} 或 {'result': {'utterances': [...]}}
+            res = payload_msg.get("result")
+            if isinstance(res, dict):
+                text = res.get("text")
+                if isinstance(text, str) and text:
+                    return text
+                utts = res.get("utterances")
+                if isinstance(utts, list) and utts:
+                    texts = [u.get("text") for u in utts if isinstance(u, dict) and u.get("text")]
+                    if texts:
+                        return " ".join(texts)
+            # 有些返回可能直接带 text 字段
+            text = payload_msg.get("text")
+            if isinstance(text, str):
+                return text
+        # 兜底：返回 JSON 字符串
+        return json.dumps(payload_msg, ensure_ascii=False)
+    except Exception:
+        return ""
+
 async def main():
     import argparse
     
@@ -521,6 +547,8 @@ async def main():
                        help="Audio duration(ms) per packet, default:200 (recommended)")
     parser.add_argument("--resource-id", type=str, default=config.resource_id,
                        help="Resource ID: volc.bigasr.sauc.duration or volc.bigasr.sauc.concurrent")
+    parser.add_argument("--output-mode", choices=["final", "all"], default="final",
+                       help="输出模式：final 仅打印最终文本；all 打印所有服务端响应")
     
     args = parser.parse_args()
     # 同步传入的资源 ID 到运行配置
@@ -528,8 +556,21 @@ async def main():
     
     async with AsrWsClient(args.url, args.seg_duration) as client:  # 使用async with
         try:
+            final_text = None
             async for response in client.execute(args.file):
-                logger.info(f"Received response: {json.dumps(response.to_dict(), indent=2, ensure_ascii=False)}")
+                if args.output_mode == "all":
+                    logger.info(f"Received response: {json.dumps(response.to_dict(), indent=2, ensure_ascii=False)}")
+                else:
+                    # 只打印最终结果
+                    if response.is_last_package:
+                        final_text = extract_final_text(response.payload_msg)
+                        break
+            if args.output_mode == "final":
+                if final_text is not None:
+                    logger.info(f"Final Text: {final_text}")
+                    print(f"Final Text: {final_text}")
+                else:
+                    logger.warning("未获取到最终结果文本。")
         except Exception as e:
             logger.error(f"ASR processing failed: {e}")
 
