@@ -113,7 +113,78 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
 
 ---
 
-## 发送协议与分包策略
+## 实时流式识别服务（WebSocket）
+
+本仓库新增 `sauc_asr_server.py`，提供一个后端 WebSocket 服务，供前端推送音频实现实时流式识别。该服务会将每一次连接作为一个独立会话（session），在 `sessions/<YYYYMMDD>/<session_id>/` 目录下保存日志与响应。
+
+- 启动服务：
+  - `python sauc_asr_server.py --host 0.0.0.0 --port 8080`
+- 接入地址：
+  - `ws://<host>:8080/ws-asr?resource_id=volc.bigasr.sauc.duration&url=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`
+- 会话日志：
+  - `session.log`：会话级日志
+  - `responses.jsonl`：后端 ASR 响应（JSON 行）
+  - `metadata.json`：连接元数据（resource_id、backend_url、session_id、logid）
+
+### 前端消息协议
+
+- 文本消息（JSON）：
+  - `{"event":"end"}`：表示音频发送结束，服务端将发送最后一包并等待最终结果
+  - `{"event":"ping"}`：心跳，服务端返回 `{"type":"pong"}`
+- 二进制消息：
+  - 直接发送 PCM16/16kHz/mono 原始字节（推荐每包 200ms 左右）。服务端将按到达顺序转发至 SAUC v3，并实时返回增量/最终结果。
+
+### 服务端返回消息（JSON 文本）
+
+- 结果消息：
+  - `{ "type": "result", "session_id": "...", "sequence": <int>, "final": <bool>, "text": "...", "logid": "..." }`
+  - `final=false` 表示增量结果；`final=true` 表示最终结果。
+- 错误消息：
+  - `{ "type": "error", "session_id": "...", "message": "..." }`
+
+### 前端示例（浏览器）
+
+以下示例展示如何使用 WebAudio 将麦克风采集的音频转换为 PCM16 并通过 WebSocket 发送到服务端（示意代码，需根据实际环境调整）：
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080/ws-asr');
+ws.onmessage = (evt) => {
+  const msg = JSON.parse(evt.data);
+  if (msg.type === 'result') {
+    console.log(msg.final ? 'Final:' : 'Partial:', msg.text);
+  } else if (msg.type === 'error') {
+    console.error('Error:', msg.message);
+  }
+};
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+  const source = audioCtx.createMediaStreamSource(stream);
+  const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0); // Float32Array [-1.0, 1.0]
+    // 转换为 PCM16 Little-Endian
+    const pcm16 = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      let s = Math.max(-1, Math.min(1, input[i]));
+      pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    ws.send(new Blob([pcm16.buffer]));
+  };
+});
+
+// 结束时：
+// ws.send(JSON.stringify({ event: 'end' }));
+```
+
+### 重要说明
+
+- 后端桥接使用 SAUC v3 优化双向流式接口 `bigmodel_async`，更适合实时增量返回；完整请求使用 JSON+GZIP，音频分包使用 NO_SERIALIZATION+GZIP。
+- 音频格式要求：PCM16/16kHz/mono 原始数据。如果前端只能输出其它格式，请在前端完成转码或在后端增加流式转码逻辑（复杂度较高）。
+- 分包建议：200ms 左右，有利于兼顾实时性与识别稳定性。
+- 每个连接会生成唯一 `session_id` 并独立保存日志，便于问题追踪与统计。
 
 - 客户端完整请求（JSON + GZIP 压缩）先行发送，随后发送音频分包。
 - 仅发送 WAV 的 data 子块（纯音频数据），不包含文件头，兼容性更佳。
