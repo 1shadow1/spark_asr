@@ -118,9 +118,9 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
 本仓库新增 `sauc_asr_server.py`，提供一个后端 WebSocket 服务，供前端推送音频实现实时流式识别。该服务会将每一次连接作为一个独立会话（session），在 `sessions/<YYYYMMDD>/<session_id>/` 目录下保存日志与响应。
 
 - 启动服务：
-  - `python sauc_asr_server.py --host 0.0.0.0 --port 8080`
+  - `python sauc_asr_server.py --host 0.0.0.0 --port 8081`
 - 接入地址：
-  - `ws://<host>:8080/ws-asr?resource_id=volc.bigasr.sauc.duration&url=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`
+  - `ws://<host>:8081/ws-asr?resource_id=volc.bigasr.sauc.duration&url=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`
 - 会话日志：
   - `session.log`：会话级日志
   - `responses.jsonl`：后端 ASR 响应（JSON 行）
@@ -147,7 +147,7 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
 以下示例展示如何使用 WebAudio 将麦克风采集的音频转换为 PCM16 并通过 WebSocket 发送到服务端（示意代码，需根据实际环境调整）：
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/ws-asr');
+const ws = new WebSocket('ws://localhost:8081/ws-asr');
 ws.onmessage = (evt) => {
   const msg = JSON.parse(evt.data);
   if (msg.type === 'result') {

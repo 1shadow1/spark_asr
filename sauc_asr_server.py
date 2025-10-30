@@ -373,13 +373,28 @@ async def ws_asr_handler(request: web.Request):
 def build_app():
     app = web.Application()
     app.add_routes([web.get('/ws-asr', ws_asr_handler)])
+
+    async def test_client_handler(request: web.Request):
+        """
+        测试页面路由：提供浏览器端WebSocket录音测试页。
+        输入：HTTP GET请求
+        输出：返回本地test_client.html静态文件
+        """
+        from pathlib import Path
+        fp = Path(__file__).parent / "test_client.html"
+        if not fp.exists():
+            return web.Response(status=404, text="test_client.html not found")
+        return web.FileResponse(path=str(fp))
+
+    # 提供测试页面访问
+    app.add_routes([web.get('/', test_client_handler), web.get('/test_client.html', test_client_handler)])
     return app
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Real-time ASR WebSocket Server (SAUC v3 bridge)')
     parser.add_argument('--host', default='0.0.0.0')
-    parser.add_argument('--port', type=int, default=8080)
+    parser.add_argument('--port', type=int, default=8081)
     args = parser.parse_args()
     app = build_app()
     web.run_app(app, host=args.host, port=args.port)
