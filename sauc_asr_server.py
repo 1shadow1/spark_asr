@@ -288,32 +288,63 @@ class SaucSession:
             self.seq += 1
 
     async def recv_loop(self, frontend_ws: web.WebSocketResponse):
-        async for msg in self.backend_ws:
-            if msg.type == aiohttp.WSMsgType.BINARY:
-                resp = ResponseParser.parse_response(msg.data)
-                self._log_response(resp)
-                final = bool(resp.is_last_package)
-                text = extract_final_text(resp.payload_msg)
-                out = {
-                    "type": "result",
-                    "session_id": self.session_id,
-                    "sequence": resp.payload_sequence,
-                    "final": final,
-                    "text": text,
-                    "logid": self.logid,
-                }
-                await frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
-                if final or resp.code != 0:
+        """
+        后端接收循环：从 SAUC 后端 WebSocket 持续读取响应并转发给前端。
+        输入：frontend_ws 前端的 WebSocketResponse
+        输出：无（通过 frontend_ws 发送文本消息），函数在收到最终包或错误时退出。
+        逻辑：
+        - 解析后端二进制响应，写入本地日志并转发给前端
+        - 在前端连接关闭或写入异常时，停止发送并退出循环
+        - 收到最终包（is_last_package=True）或非零 code 时退出
+        """
+        try:
+            async for msg in self.backend_ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    resp = ResponseParser.parse_response(msg.data)
+                    self._log_response(resp)
+                    final = bool(resp.is_last_package)
+                    text = extract_final_text(resp.payload_msg)
+                    out = {
+                        "type": "result",
+                        "session_id": self.session_id,
+                        "sequence": resp.payload_sequence,
+                        "final": final,
+                        "text": text,
+                        "logid": self.logid,
+                    }
+                    # 前端已关闭则停止发送
+                    if frontend_ws.closed:
+                        self.session_logger.warning("Frontend WS closed; stop forwarding")
+                        break
+                    try:
+                        await frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                    except (aiohttp.client_exceptions.ClientConnectionResetError, ConnectionResetError):
+                        # 前端写端关闭或网络重置，退出循环
+                        self.session_logger.warning("Cannot write to closing transport; stop forwarding")
+                        break
+                    except Exception as e:
+                        # 其他写入异常，记录后退出
+                        self.session_logger.error(f"Forwarding to frontend failed: {e}")
+                        break
+                    if final or resp.code != 0:
+                        break
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    # 尽量通知前端错误，但若前端已关闭需忽略
+                    if not frontend_ws.closed:
+                        try:
+                            await frontend_ws.send_str(json.dumps({
+                                "type": "error",
+                                "session_id": self.session_id,
+                                "message": "backend websocket error"
+                            }))
+                        except Exception:
+                            pass
                     break
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                await frontend_ws.send_str(json.dumps({
-                    "type": "error",
-                    "session_id": self.session_id,
-                    "message": "backend websocket error"
-                }))
-                break
-            elif msg.type == aiohttp.WSMsgType.CLOSED:
-                break
+                elif msg.type == aiohttp.WSMsgType.CLOSED:
+                    break
+        except asyncio.CancelledError:
+            # 任务被上层取消，正常退出
+            pass
 
     def _log_response(self, resp: AsrResponse):
         with open(self.responses_path, 'a', encoding='utf-8') as f:
@@ -363,9 +394,16 @@ async def ws_asr_handler(request: web.Request):
             elif msg.type == aiohttp.WSMsgType.CLOSED:
                 break
     finally:
-        await recv_task
+        # 优先终止后端接收循环，避免在前端关闭后继续写入
+        if recv_task and not recv_task.done():
+            recv_task.cancel()
+            try:
+                await recv_task
+            except asyncio.CancelledError:
+                pass
         await session.close()
-        await ws.close()
+        if not ws.closed:
+            await ws.close()
 
     return ws
 
