@@ -7,6 +7,7 @@ import struct
 import uuid
 import logging
 import os
+import re
 from datetime import datetime
 
 # 基础日志（全局）
@@ -48,6 +49,10 @@ except Exception:
     APP_KEY = os.getenv("APP_KEY", "")
     ACCESS_KEY = os.getenv("ACCESS_KEY", "")
     DEFAULT_RESOURCE_ID = os.getenv("RESOURCE_ID", "volc.bigasr.sauc.duration")
+
+# 对话服务配置（可通过环境变量或查询参数覆盖）
+DEFAULT_DIALOG_URL = os.getenv("DIALOG_URL", "http://localhost:9000/api/chat")
+DEFAULT_SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "你是一个礼貌且简洁的助手。")
 
 # 结果文本提取
 def extract_final_text(payload_msg):
@@ -184,6 +189,7 @@ class SaucSession:
         self.http = aiohttp.ClientSession()
         self.backend_ws = None
         self.logid = None
+        self.dialog_bridge = None  # 将在 handler 中注入
         # 会话日志目录
         base_dir = os.path.join(os.getcwd(), 'sessions', datetime.now().strftime('%Y%m%d'), session_id)
         os.makedirs(base_dir, exist_ok=True)
@@ -326,6 +332,13 @@ class SaucSession:
                         # 其他写入异常，记录后退出
                         self.session_logger.error(f"Forwarding to frontend failed: {e}")
                         break
+
+                    # 将识别更新交由对话桥处理（提交断句到后端对话服务）
+                    if self.dialog_bridge is not None:
+                        try:
+                            await self.dialog_bridge.on_recognition_update(text or "", final)
+                        except Exception as e:
+                            self.session_logger.error(f"DialogBridge handling failed: {e}")
                     if final or resp.code != 0:
                         break
                 elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -363,6 +376,8 @@ async def ws_asr_handler(request: web.Request):
     # 参数：资源ID与后端URL可通过查询参数指定，否则使用默认
     url = request.query.get('url', 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async')
     resource_id = request.query.get('resource_id', DEFAULT_RESOURCE_ID)
+    dialog_url = request.query.get('dialog_url', DEFAULT_DIALOG_URL)
+    system_prompt = request.query.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -372,6 +387,16 @@ async def ws_asr_handler(request: web.Request):
     session = SaucSession(session_id, url, resource_id, loop)
 
     await session.start()
+    # 初始化对话桥（桥接识别文本到对话后端）
+    session.dialog_bridge = DialogBridge(
+        session_id=session_id,
+        dialog_url=dialog_url,
+        http=session.http,
+        frontend_ws=ws,
+        logger=session.session_logger,
+        system_prompt=system_prompt,
+        session_dir=session.base_dir,
+    )
     recv_task = asyncio.create_task(session.recv_loop(ws))
 
     try:
@@ -401,6 +426,12 @@ async def ws_asr_handler(request: web.Request):
                 await recv_task
             except asyncio.CancelledError:
                 pass
+        # 关闭对话桥
+        if session.dialog_bridge is not None:
+            try:
+                await session.dialog_bridge.close()
+            except Exception:
+                pass
         await session.close()
         if not ws.closed:
             await ws.close()
@@ -427,6 +458,171 @@ def build_app():
     # 提供测试页面访问
     app.add_routes([web.get('/', test_client_handler), web.get('/test_client.html', test_client_handler)])
     return app
+
+# 对话桥：将实时识别文本以自然断句提交给后端对话服务
+class DialogBridge:
+    def __init__(self, session_id: str, dialog_url: str, http: aiohttp.ClientSession,
+                 frontend_ws: web.WebSocketResponse, logger: logging.Logger,
+                 system_prompt: str, session_dir: str):
+        """
+        对话桥接
+        输入：
+        - session_id: 会话ID
+        - dialog_url: 对话后端URL（POST 接口）
+        - http: 共享的 aiohttp.ClientSession
+        - frontend_ws: 前端 WebSocket，用于转发对话响应
+        - logger: 日志记录器
+        - system_prompt: 系统提示词（用于对话后端）
+        - session_dir: 会话目录，用于落盘日志
+        输出：无
+        说明：
+        - 维护增量识别的缓冲，根据断句策略提交给对话后端
+        - 接收后端响应并转发到前端（type=dialog）
+        - 支持错误重试与简单使用量统计记录
+        """
+        self.session_id = session_id
+        self.dialog_url = dialog_url
+        self.http = http
+        self.frontend_ws = frontend_ws
+        self.logger = logger
+        self.system_prompt = system_prompt
+        self.session_dir = session_dir
+        self.buffer = ""  # 当前累计文本
+        self.last_sent_index = 0  # 最近提交到对话的文本边界索引
+        self.re_punct = re.compile(r"[。！？!?\.]+")
+        self.retry_max = 2
+        self.usage_tokens = 0
+        self.dialog_log_path = os.path.join(session_dir, 'dialog_events.jsonl')
+
+    async def on_recognition_update(self, text: str, is_final: bool):
+        """
+        处理识别增量更新
+        输入：最新识别的完整文本（可能包含历史）、是否最终包
+        输出：必要时将完整句子提交到后端
+        策略：
+        - 基于最长公共前缀找出新增部分
+        - 当新增部分包含强标点（。！？.!?）形成完整句子时提交
+        - 若收到最终包，提交剩余未发送文本
+        """
+        if not text:
+            if is_final:
+                await self._flush_remaining()
+            return
+
+        # 扩展缓冲为最新文本（覆盖式，以服务端最新为准）
+        self.buffer = text
+        # 找到未发送区间
+        unsent = self.buffer[self.last_sent_index:]
+        if not unsent and not is_final:
+            return
+
+        sentences = self._split_complete_sentences(unsent)
+        # 逐句提交
+        for s in sentences:
+            await self._submit_to_dialog(s)
+            self.last_sent_index += len(s)
+
+        # 最终包时提交尾部非完整句
+        if is_final:
+            tail = self.buffer[self.last_sent_index:].strip()
+            if tail:
+                await self._submit_to_dialog(tail)
+                self.last_sent_index = len(self.buffer)
+
+    def _split_complete_sentences(self, text: str):
+        """将文本按强标点拆分为完整句子（保留标点）"""
+        if not text:
+            return []
+        out = []
+        start = 0
+        for m in self.re_punct.finditer(text):
+            end = m.end()
+            sent = text[start:end]
+            if sent.strip():
+                out.append(sent)
+            start = end
+        return out
+
+    async def _submit_to_dialog(self, sentence: str):
+        """
+        提交一句用户输入到对话后端，并将响应转发给前端
+        输入：句子字符串
+        输出：无（将响应通过 frontend_ws 发送）
+        """
+        payload = {
+            "session_id": self.session_id,
+            "role": "user",
+            "content": sentence,
+            "system_prompt": self.system_prompt,
+        }
+        event = {"type": "dialog_submit", "t": datetime.now().isoformat(), "payload": payload}
+        self._append_dialog_log(event)
+
+        attempt = 0
+        while attempt <= self.retry_max:
+            try:
+                async with self.http.post(self.dialog_url, json=payload, timeout=20) as resp:
+                    ok = (resp.status // 100) == 2
+                    data = None
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        raw = await resp.text()
+                        data = {"raw": raw}
+                    if not ok:
+                        raise RuntimeError(f"Dialog HTTP {resp.status}: {data}")
+
+                    # 解析回复与使用量
+                    reply = data.get("reply") or data.get("content") or data.get("text") or ""
+                    usage = data.get("usage") or {}
+                    self._record_usage(usage)
+                    # 转发到前端
+                    if not self.frontend_ws.closed:
+                        out = {
+                            "type": "dialog",
+                            "session_id": self.session_id,
+                            "user_sentence": sentence,
+                            "reply": reply,
+                            "usage": usage,
+                        }
+                        try:
+                            await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                        except Exception:
+                            pass
+                    self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": data})
+                    return
+            except Exception as e:
+                self.logger.warning(f"Dialog submit failed (attempt {attempt+1}): {e}")
+                self._append_dialog_log({"type": "dialog_error", "t": datetime.now().isoformat(), "error": str(e)})
+                attempt += 1
+                await asyncio.sleep(min(2 ** attempt, 5))
+
+    async def _flush_remaining(self):
+        tail = self.buffer[self.last_sent_index:].strip()
+        if tail:
+            await self._submit_to_dialog(tail)
+            self.last_sent_index = len(self.buffer)
+
+    def _record_usage(self, usage: dict):
+        """记录使用量（若后端返回 token 计数则累计）"""
+        try:
+            total = int(usage.get("total_tokens") or 0)
+            if total:
+                self.usage_tokens += total
+        except Exception:
+            pass
+
+    def _append_dialog_log(self, item: dict):
+        try:
+            with open(self.dialog_log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    async def close(self):
+        # 可在此做资源清理或汇总
+        summary = {"type": "dialog_summary", "t": datetime.now().isoformat(), "usage_tokens": self.usage_tokens}
+        self._append_dialog_log(summary)
 
 if __name__ == '__main__':
     import argparse
