@@ -5,7 +5,7 @@
 - Access Token（Access Key）：3hpVlzSZZkLakcOEMsfKDcDDWWdKCxpb
 - Secret Key：XvE8oA0RSecmzf5RB45Ln3eTvNQFDT8b（当前协议未用到，保留）
 
-脚本默认使用「最高准确率」的接口模式：`bigmodel_nostream`（流式输入模式：输入音频>15s或发送最后一包后返回结果，准确率更高）。
+脚本默认使用优化双向流式接口：`bigmodel_async`（更适合实时增量返回）。如果你的账号未开通该端点或握手失败，后端服务会自动回退到 `bigmodel_nostream`（流式输入模式，发送最后一包后返回最终结果）。
 
 ---
 
@@ -64,7 +64,7 @@ pip install aiohttp
 python f:\work\singa\spark_asr\sauc_websocket_demo.py --file <你的音频文件路径>
 ```
 
-- 默认接口 URL：`wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream`（最高准确率）
+- 默认接口 URL：`wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`（实时增量）
 - 默认分包时长：`--seg-duration 200`（推荐 200ms）
 - 可选资源 ID：
   - 小时版：`--resource-id volc.bigasr.sauc.duration`
@@ -89,11 +89,9 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
 - 流式输入模式（最高准确率）：`wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream`
   - 当累计输入音频 > 15s 或发送最后一包（负序列包）后返回识别结果，准确率更高。
 
-本脚本默认使用 `bigmodel_nostream` 并在完整请求 payload 中启用：
-- ITN（数字归一化）：`enable_itn=True`
-- 标点：`enable_punc=True`
-- DDC（脏词清理）：`enable_ddc=True`
-- 非双向流式模式标记：`enable_nonstream=True`
+完整请求 payload 会根据端点类型动态设置：
+- 对 async/stream 端点：`show_utterances=True`、`enable_nonstream=False`
+- 对 nonstream 端点：`show_utterances=False`、`enable_nonstream=True`
 
 ---
 
@@ -120,7 +118,12 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
 - 启动服务：
   - `python sauc_asr_server.py --host 0.0.0.0 --port 8081`
 - 接入地址：
-  - `ws://<host>:8081/ws-asr?resource_id=volc.bigasr.sauc.duration&url=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`
+  - `ws://<host>:8081/ws-asr?resource_id=volc.bigasr.sauc.duration`
+  - 可选：指定后端端点
+    - async（默认）：`&url=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`
+    - nonstream：`&url=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream`
+  - 可选：覆盖凭据（仅用于本地联调，不建议生产使用）
+    - 通过查询参数：`&app_key=<你的APP_KEY>&access_key=<你的ACCESS_KEY>`
 - 会话日志：
   - `session.log`：会话级日志
   - `responses.jsonl`：后端 ASR 响应（JSON 行）
@@ -181,10 +184,12 @@ navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
 
 ### 重要说明
 
-- 后端桥接使用 SAUC v3 优化双向流式接口 `bigmodel_async`，更适合实时增量返回；完整请求使用 JSON+GZIP，音频分包使用 NO_SERIALIZATION+GZIP。
+- 后端桥接默认使用 SAUC v3 优化双向流式接口 `bigmodel_async`；若握手失败会自动回退到 `bigmodel_nostream`。
+- 完整请求使用 JSON+GZIP，音频分包使用 NO_SERIALIZATION+GZIP。
 - 音频格式要求：PCM16/16kHz/mono 原始数据。如果前端只能输出其它格式，请在前端完成转码或在后端增加流式转码逻辑（复杂度较高）。
 - 分包建议：200ms 左右，有利于兼顾实时性与识别稳定性。
 - 每个连接会生成唯一 `session_id` 并独立保存日志，便于问题追踪与统计。
+ - 若缺少 `app_key/access_key/resource_id`，服务端会在握手前返回友好错误提示。
 
 - 客户端完整请求（JSON + GZIP 压缩）先行发送，随后发送音频分包。
 - 仅发送 WAV 的 data 子块（纯音频数据），不包含文件头，兼容性更佳。
@@ -211,6 +216,13 @@ navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
 
 - 切勿将密钥提交到公共仓库。
 - 生产环境请通过环境变量或密钥管理服务加载凭据，例如：
+  - 在 Linux 中设置（示例）：
+    ```bash
+    export APP_KEY="<你的APP_KEY>"
+    export ACCESS_KEY="<你的ACCESS_KEY>"
+    export RESOURCE_ID="volc.bigasr.sauc.duration"
+    python sauc_asr_server.py --host 0.0.0.0 --port 8081
+    ```
   - 在 PowerShell 中设置：
     ```powershell
     $env:APP_KEY="5142285262"

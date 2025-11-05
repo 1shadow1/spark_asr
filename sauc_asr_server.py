@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 
 # 基础日志（全局）
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,6 +41,27 @@ class CompressionType:
     GZIP = 0b0001
 
 # 凭据读取（复用 sauc_websocket_demo.py 中的配置或环境变量）
+def load_env_file():
+    """从项目根目录加载 .env 并合并到环境变量（若存在）。"""
+    env_path = Path(__file__).parent / '.env'
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(encoding='utf-8').splitlines():
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, val = line.split('=', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    # 若当前进程环境缺少该变量则注入
+                    if key and val and (key not in os.environ or not os.getenv(key)):
+                        os.environ[key] = val
+        except Exception:
+            pass
+
+# 先加载 .env，再读取环境变量或 demo 配置
+load_env_file()
 try:
     import sauc_websocket_demo as demo
     APP_KEY = demo.config.app_key
@@ -51,7 +73,7 @@ except Exception:
     DEFAULT_RESOURCE_ID = os.getenv("RESOURCE_ID", "volc.bigasr.sauc.duration")
 
 # 对话服务配置（可通过环境变量或查询参数覆盖）
-DEFAULT_DIALOG_URL = os.getenv("DIALOG_URL", "http://localhost:9000/api/chat")
+DEFAULT_DIALOG_URL = os.getenv("DIALOG_URL", "http://localhost:8084/api/chat")
 DEFAULT_SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "你是一个礼貌且简洁的助手。")
 
 # 结果文本提取
@@ -218,7 +240,27 @@ class SaucSession:
             "X-Api-Access-Key": ACCESS_KEY,
             "X-Api-App-Key": APP_KEY,
         }
-        self.backend_ws = await self.http.ws_connect(self.url, headers=headers)
+        try:
+            self.backend_ws = await self.http.ws_connect(self.url, headers=headers)
+        except aiohttp.WSServerHandshakeError as e:
+            # 握手失败时，若当前为 async 端点，则尝试回退到 nonstream 端点
+            self.session_logger.error(f"Handshake failed for {self.url}: status={getattr(e, 'status', '?')} message={getattr(e, 'message', '')}")
+            if 'bigmodel_async' in self.url:
+                fallback = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream'
+                self.session_logger.info(f"Falling back to {fallback}")
+                self.url = fallback
+                self.backend_ws = await self.http.ws_connect(self.url, headers=headers)
+            else:
+                raise
+        except Exception as e:
+            # 其他连接异常也尝试一次回退（仅当当前为 async 端点）
+            if 'bigmodel_async' in self.url:
+                fallback = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream'
+                self.session_logger.warning(f"Connect failed for {self.url} ({e}); trying fallback {fallback}")
+                self.url = fallback
+                self.backend_ws = await self.http.ws_connect(self.url, headers=headers)
+            else:
+                raise
         try:
             self.logid = self.backend_ws.headers.get('X-Tt-Logid') or self.backend_ws.headers.get('X-Tt-LogId')
         except Exception:
@@ -226,8 +268,14 @@ class SaucSession:
         self.session_logger.info(f"Connected to SAUC: logid={self.logid}, connect_id={headers.get('X-Api-Connect-Id')}")
 
     def _build_full_request(self) -> bytes:
+        """
+        构建完整请求（JSON + GZIP），根据后端端点动态设置模式参数。
+        - 当使用 async/stream 端点时：开启增量（show_utterances=True），禁用非流式（enable_nonstream=False）。
+        - 当使用 nonstream 端点时：关闭增量（show_utterances=False），启用非流式（enable_nonstream=True）。
+        """
         header = AsrRequestHeader()\
             .with_message_type_specific_flags(MessageTypeSpecificFlags.POS_SEQUENCE)
+        use_nonstream = ('bigmodel_nostream' in (self.url or ''))
         payload = {
             "user": {"uid": self.session_id},
             "audio": {
@@ -238,12 +286,12 @@ class SaucSession:
                 "channel": 1
             },
             "request": {
-                "model_name": "bigmodel",           # 大模型
+                "model_name": "bigmodel",
                 "enable_itn": True,
                 "enable_punc": True,
                 "enable_ddc": True,
-                "show_utterances": True,             # 开启增量结果
-                "enable_nonstream": False            # 采用双向流式
+                "show_utterances": (not use_nonstream),
+                "enable_nonstream": use_nonstream
             }
         }
         payload_bytes = json.dumps(payload).encode('utf-8')
@@ -373,9 +421,14 @@ class SaucSession:
 
 # WebSocket 处理器
 async def ws_asr_handler(request: web.Request):
+    # 为后续赋值声明全局变量，避免 Python 作用域冲突
+    global APP_KEY, ACCESS_KEY
     # 参数：资源ID与后端URL可通过查询参数指定，否则使用默认
     url = request.query.get('url', 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async')
     resource_id = request.query.get('resource_id', DEFAULT_RESOURCE_ID)
+    # 支持通过查询参数覆盖凭据（用于Linux服务进程没有环境变量时）
+    app_key = request.query.get('app_key', APP_KEY)
+    access_key = request.query.get('access_key', ACCESS_KEY)
     dialog_url = request.query.get('dialog_url', DEFAULT_DIALOG_URL)
     system_prompt = request.query.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
 
@@ -384,6 +437,23 @@ async def ws_asr_handler(request: web.Request):
 
     session_id = str(uuid.uuid4())
     loop = asyncio.get_event_loop()
+    # 运行时凭据校验与友好错误返回
+    if not app_key or not access_key or not resource_id:
+        err = {
+            "type": "error",
+            "session_id": session_id,
+            "message": "missing credentials: app_key/access_key/resource_id",
+        }
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str(json.dumps(err))
+        await ws.close()
+        return ws
+
+    # 将凭据注入全局（简化后续 connect_backend 使用）
+    APP_KEY = app_key
+    ACCESS_KEY = access_key
+
     session = SaucSession(session_id, url, resource_id, loop)
 
     await session.start()

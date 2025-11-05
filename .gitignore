@@ -4,3 +4,6 @@
 /sessions
 /_pycache_
 *.pyc
+
+# local environment files
+.env
