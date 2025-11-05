@@ -704,6 +704,22 @@ class DialogBridge:
         else:
             self.enable_soft_submit = bool(enable_soft_submit)
 
+        # 新增：静默自动提交阈值（毫秒）。当识别文本在该时间内没有增长，视为一句话结束，触发提交。
+        # 配置来源：环境变量 DIALOG_SILENCE_FLUSH_MS；默认 1200ms
+        try:
+            self.silence_flush_ms = int(os.getenv("DIALOG_SILENCE_FLUSH_MS", "1200"))
+        except Exception:
+            self.silence_flush_ms = 1200
+        # 运行时状态：最近文本增长时间戳（毫秒）、最近缓冲长度、提交并发锁与静默监控任务
+        self._last_growth_ts_ms = int(datetime.now().timestamp() * 1000)
+        self._last_buffer_len = 0
+        self._submit_lock = asyncio.Lock()
+        # 启动静默监控任务（后台周期检查）
+        try:
+            self._silence_task = asyncio.create_task(self._silence_watchdog())
+        except Exception:
+            self._silence_task = None
+
         # 语音克隆 TTS 配置与前端音频日志
         # 说明：当启用语音克隆时，我们会在每个 reply 段（stream=true）与最终回复（stream=false）
         # 异步调用 TTS 服务，并将返回的 MP3 按到达顺序以 Base64 分片推送到前端。
@@ -796,6 +812,14 @@ class DialogBridge:
         self.buffer = text
         # 找到未发送区间
         unsent = self.buffer[self.last_sent_index:]
+        # 记录文本增长：当缓冲长度增加时更新增长时间戳，用于静默判断
+        try:
+            cur_len = len(self.buffer)
+            if cur_len > self._last_buffer_len:
+                self._last_buffer_len = cur_len
+                self._last_growth_ts_ms = int(datetime.now().timestamp() * 1000)
+        except Exception:
+            pass
         if not unsent and not is_final:
             return
 
@@ -825,6 +849,54 @@ class DialogBridge:
             if tail:
                 await self._submit_to_dialog(tail)
                 self.last_sent_index = len(self.buffer)
+
+    async def _silence_watchdog(self):
+        """
+        静默监控任务：周期性检查识别文本是否在一段时间内没有增长。
+        输入：无（使用实例状态）
+        输出：当超过静默阈值且存在未提交文本时，自动提交尾部文本。
+        逻辑：
+        - 若 `DIALOG_SILENCE_FLUSH_MS` <= 0，则不启用该机制
+        - 每 200ms 检查一次当前时间与 `self._last_growth_ts_ms` 的差值
+        - 若差值超过阈值，且 `buffer[last_sent_index:]` 非空，则将尾部视为一句话提交
+        - 使用提交锁避免与正常断句提交并发
+        """
+        if (self.silence_flush_ms or 0) <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(0.2)
+                # 前端可能已关闭；若 WS 已关闭则结束监控
+                if self.frontend_ws.closed:
+                    break
+                # 读取尾部未提交文本
+                tail = None
+                try:
+                    tail = self.buffer[self.last_sent_index:].strip()
+                except Exception:
+                    tail = ""
+                if not tail:
+                    continue
+                # 判断是否超过静默阈值
+                now_ms = int(datetime.now().timestamp() * 1000)
+                if (now_ms - self._last_growth_ts_ms) < self.silence_flush_ms:
+                    continue
+                # 触发一次提交（加锁避免与正常 on_recognition_update 并发冲突）
+                async with self._submit_lock:
+                    # 再次读取尾部（锁内）并提交
+                    tail2 = self.buffer[self.last_sent_index:].strip()
+                    if not tail2:
+                        continue
+                    try:
+                        await self._submit_to_dialog(tail2)
+                        self.last_sent_index = len(self.buffer)
+                        # 重置增长时间戳，避免重复提交
+                        self._last_growth_ts_ms = now_ms
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            # 任务被取消，正常退出
+            return
 
     def _split_complete_sentences(self, text: str):
         """
@@ -1444,6 +1516,12 @@ class DialogBridge:
         # 可在此做资源清理或汇总
         summary = {"type": "dialog_summary", "t": datetime.now().isoformat(), "usage_tokens": self.usage_tokens}
         self._append_dialog_log(summary)
+        # 取消静默监控任务
+        try:
+            if getattr(self, "_silence_task", None):
+                self._silence_task.cancel()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     import argparse
