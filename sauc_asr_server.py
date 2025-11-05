@@ -573,6 +573,9 @@ class DialogBridge:
         self.retry_max = 2
         self.usage_tokens = 0
         self.dialog_log_path = os.path.join(session_dir, 'dialog_events.jsonl')
+        # 新增：分别记录对话请求与返回给前端的对话消息
+        self.dialog_req_log_path = os.path.join(session_dir, 'dialog_requests.jsonl')
+        self.frontend_dialog_log_path = os.path.join(session_dir, 'frontend_dialog.jsonl')
         # 自动提交的最小长度阈值（当无强标点、非最终包时避免长时间不提交）
         try:
             self.autoflush_min_chars = int(os.getenv("DIALOG_AUTOF_FLUSH_LEN", "12"))
@@ -658,6 +661,14 @@ class DialogBridge:
                         "X-Voice-Id": self.voice_id,
                     }
                     body = {"input": sentence, "sessionId": self.session_id}
+                    # 记录将要发送的请求
+                    self._append_dialog_request({
+                        "t": datetime.now().isoformat(),
+                        "mode": "sse",
+                        "url": self.dialog_url,
+                        "headers": headers,
+                        "body": body,
+                    })
                     async with self.http.post(self.dialog_url, headers=headers, json=body, timeout=30) as resp:
                         if (resp.status // 100) != 2:
                             text = await resp.text()
@@ -690,6 +701,11 @@ class DialogBridge:
                                             await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
                                         except Exception:
                                             pass
+                                    # 记录返回给前端的对话增量消息
+                                    self._append_frontend_dialog({
+                                        "t": datetime.now().isoformat(),
+                                        "data": out,
+                                    })
                                     full_reply.append(data_str)
                         # 汇总发送最终结果
                         final = "".join(full_reply).strip()
@@ -706,6 +722,11 @@ class DialogBridge:
                                 await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
                             except Exception:
                                 pass
+                        # 记录返回给前端的最终对话消息
+                        self._append_frontend_dialog({
+                            "t": datetime.now().isoformat(),
+                            "data": out,
+                        })
                         self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": {"reply": final, "mode": "sse"}})
                         return
                 else:
@@ -716,6 +737,14 @@ class DialogBridge:
                         "content": sentence,
                         "system_prompt": self.system_prompt,
                     }
+                    # 记录将要发送的请求
+                    self._append_dialog_request({
+                        "t": datetime.now().isoformat(),
+                        "mode": "json",
+                        "url": self.dialog_url,
+                        "headers": {"Content-Type": "application/json"},
+                        "body": payload,
+                    })
                     async with self.http.post(self.dialog_url, json=payload, timeout=20) as resp:
                         ok = (resp.status // 100) == 2
                         data = None
@@ -741,6 +770,11 @@ class DialogBridge:
                                 await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
                             except Exception:
                                 pass
+                        # 记录返回给前端的对话消息
+                        self._append_frontend_dialog({
+                            "t": datetime.now().isoformat(),
+                            "data": out,
+                        })
                         self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": data})
                         return
             except Exception as e:
@@ -767,6 +801,22 @@ class DialogBridge:
     def _append_dialog_log(self, item: dict):
         try:
             with open(self.dialog_log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _append_dialog_request(self, item: dict):
+        """记录发送到 /srv/chat 服务的请求（JSON 行）。"""
+        try:
+            with open(self.dialog_req_log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _append_frontend_dialog(self, item: dict):
+        """记录返回给前端的 type=dialog 消息（JSON 行）。"""
+        try:
+            with open(self.frontend_dialog_log_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         except Exception:
             pass
