@@ -73,7 +73,9 @@ except Exception:
     DEFAULT_RESOURCE_ID = os.getenv("RESOURCE_ID", "volc.bigasr.sauc.duration")
 
 # 对话服务配置（可通过环境变量或查询参数覆盖）
-DEFAULT_DIALOG_URL = os.getenv("DIALOG_URL", "http://localhost:8084/api/chat")
+DEFAULT_DIALOG_URL = os.getenv("DIALOG_URL", "http://0.0.0.0:8084/chat/stream")
+DEFAULT_DIALOG_MODE = os.getenv("DIALOG_MODE", "sse")  # 可选：sse 或 json
+DEFAULT_VOICE_ID = os.getenv("VOICE_ID", "demo-voice")
 DEFAULT_SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "你是一个礼貌且简洁的助手。")
 
 # 结果文本提取
@@ -430,6 +432,8 @@ async def ws_asr_handler(request: web.Request):
     app_key = request.query.get('app_key', APP_KEY)
     access_key = request.query.get('access_key', ACCESS_KEY)
     dialog_url = request.query.get('dialog_url', DEFAULT_DIALOG_URL)
+    dialog_mode = request.query.get('dialog_mode', DEFAULT_DIALOG_MODE)
+    voice_id = request.query.get('voice_id', DEFAULT_VOICE_ID)
     system_prompt = request.query.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
 
     ws = web.WebSocketResponse()
@@ -466,6 +470,8 @@ async def ws_asr_handler(request: web.Request):
         logger=session.session_logger,
         system_prompt=system_prompt,
         session_dir=session.base_dir,
+        dialog_mode=dialog_mode,
+        voice_id=voice_id,
     )
     recv_task = asyncio.create_task(session.recv_loop(ws))
 
@@ -533,7 +539,7 @@ def build_app():
 class DialogBridge:
     def __init__(self, session_id: str, dialog_url: str, http: aiohttp.ClientSession,
                  frontend_ws: web.WebSocketResponse, logger: logging.Logger,
-                 system_prompt: str, session_dir: str):
+                 system_prompt: str, session_dir: str, dialog_mode: str = "sse", voice_id: str = "demo-voice"):
         """
         对话桥接
         输入：
@@ -557,12 +563,21 @@ class DialogBridge:
         self.logger = logger
         self.system_prompt = system_prompt
         self.session_dir = session_dir
+        self.dialog_mode = (dialog_mode or "sse").lower()
+        self.voice_id = voice_id or "demo-voice"
         self.buffer = ""  # 当前累计文本
         self.last_sent_index = 0  # 最近提交到对话的文本边界索引
-        self.re_punct = re.compile(r"[。！？!?\.]+")
+        # 断句规则：强标点 + 常用中文顿号/逗号/分号
+        # 注意：加入中文逗号可能带来更频繁的提交，但更贴近实时对话期待
+        self.re_punct = re.compile(r"[。！？!?…\.，、；;]+")
         self.retry_max = 2
         self.usage_tokens = 0
         self.dialog_log_path = os.path.join(session_dir, 'dialog_events.jsonl')
+        # 自动提交的最小长度阈值（当无强标点、非最终包时避免长时间不提交）
+        try:
+            self.autoflush_min_chars = int(os.getenv("DIALOG_AUTOF_FLUSH_LEN", "12"))
+        except Exception:
+            self.autoflush_min_chars = 12
 
     async def on_recognition_update(self, text: str, is_final: bool):
         """
@@ -587,10 +602,17 @@ class DialogBridge:
             return
 
         sentences = self._split_complete_sentences(unsent)
-        # 逐句提交
+        # 逐句提交（强/软标点拆分）
         for s in sentences:
             await self._submit_to_dialog(s)
             self.last_sent_index += len(s)
+
+        # 若无标点拆分但文本已达到长度阈值，自动提交一次以便对话及时响应
+        if not sentences:
+            tail_candidate = unsent.strip()
+            if tail_candidate and (is_final or len(tail_candidate) >= self.autoflush_min_chars):
+                await self._submit_to_dialog(tail_candidate)
+                self.last_sent_index = len(self.buffer)
 
         # 最终包时提交尾部非完整句
         if is_final:
@@ -615,52 +637,112 @@ class DialogBridge:
 
     async def _submit_to_dialog(self, sentence: str):
         """
-        提交一句用户输入到对话后端，并将响应转发给前端
+        提交一句用户输入到对话后端，并将响应转发给前端。
         输入：句子字符串
         输出：无（将响应通过 frontend_ws 发送）
+        支持两种模式：
+        - json：原有非流式 JSON 接口
+        - sse：流式 SSE 接口（Accept: text/event-stream），逐块解析 data: 行
         """
-        payload = {
-            "session_id": self.session_id,
-            "role": "user",
-            "content": sentence,
-            "system_prompt": self.system_prompt,
-        }
-        event = {"type": "dialog_submit", "t": datetime.now().isoformat(), "payload": payload}
+        event = {"type": "dialog_submit", "t": datetime.now().isoformat(), "payload": {"sentence": sentence, "mode": self.dialog_mode}}
         self._append_dialog_log(event)
 
         attempt = 0
         while attempt <= self.retry_max:
             try:
-                async with self.http.post(self.dialog_url, json=payload, timeout=20) as resp:
-                    ok = (resp.status // 100) == 2
-                    data = None
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        raw = await resp.text()
-                        data = {"raw": raw}
-                    if not ok:
-                        raise RuntimeError(f"Dialog HTTP {resp.status}: {data}")
-
-                    # 解析回复与使用量
-                    reply = data.get("reply") or data.get("content") or data.get("text") or ""
-                    usage = data.get("usage") or {}
-                    self._record_usage(usage)
-                    # 转发到前端
-                    if not self.frontend_ws.closed:
+                if self.dialog_mode == "sse":
+                    # SSE 模式：按请求示例进行 POST
+                    headers = {
+                        "Accept": "text/event-stream",
+                        "Content-Type": "application/json",
+                        "X-Voice-Id": self.voice_id,
+                    }
+                    body = {"input": sentence, "sessionId": self.session_id}
+                    async with self.http.post(self.dialog_url, headers=headers, json=body, timeout=30) as resp:
+                        if (resp.status // 100) != 2:
+                            text = await resp.text()
+                            raise RuntimeError(f"Dialog SSE HTTP {resp.status}: {text}")
+                        # 逐块读取 SSE
+                        full_reply = []
+                        async for chunk, _ in resp.content.iter_chunks():
+                            try:
+                                line = chunk.decode('utf-8', errors='ignore')
+                            except Exception:
+                                continue
+                            for raw in line.splitlines():
+                                s = raw.strip()
+                                if not s:
+                                    continue
+                                # 常见格式：data: <payload>
+                                if s.startswith('data:'):
+                                    data_str = s[5:].strip()
+                                    # 直接转发增量文本（不强制要求 JSON）
+                                    out = {
+                                        "type": "dialog",
+                                        "session_id": self.session_id,
+                                        "user_sentence": sentence,
+                                        "reply": data_str,
+                                        "usage": {},
+                                        "stream": True,
+                                    }
+                                    if not self.frontend_ws.closed:
+                                        try:
+                                            await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                                        except Exception:
+                                            pass
+                                    full_reply.append(data_str)
+                        # 汇总发送最终结果
+                        final = "".join(full_reply).strip()
                         out = {
                             "type": "dialog",
                             "session_id": self.session_id,
                             "user_sentence": sentence,
-                            "reply": reply,
-                            "usage": usage,
+                            "reply": final,
+                            "usage": {},
+                            "stream": False,
                         }
+                        if not self.frontend_ws.closed:
+                            try:
+                                await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                            except Exception:
+                                pass
+                        self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": {"reply": final, "mode": "sse"}})
+                        return
+                else:
+                    # JSON 模式（保留兼容）
+                    payload = {
+                        "session_id": self.session_id,
+                        "role": "user",
+                        "content": sentence,
+                        "system_prompt": self.system_prompt,
+                    }
+                    async with self.http.post(self.dialog_url, json=payload, timeout=20) as resp:
+                        ok = (resp.status // 100) == 2
+                        data = None
                         try:
-                            await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                            data = await resp.json()
                         except Exception:
-                            pass
-                    self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": data})
-                    return
+                            raw = await resp.text()
+                            data = {"raw": raw}
+                        if not ok:
+                            raise RuntimeError(f"Dialog HTTP {resp.status}: {data}")
+                        reply = data.get("reply") or data.get("content") or data.get("text") or ""
+                        usage = data.get("usage") or {}
+                        self._record_usage(usage)
+                        if not self.frontend_ws.closed:
+                            out = {
+                                "type": "dialog",
+                                "session_id": self.session_id,
+                                "user_sentence": sentence,
+                                "reply": reply,
+                                "usage": usage,
+                            }
+                            try:
+                                await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                            except Exception:
+                                pass
+                        self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": data})
+                        return
             except Exception as e:
                 self.logger.warning(f"Dialog submit failed (attempt {attempt+1}): {e}")
                 self._append_dialog_log({"type": "dialog_error", "t": datetime.now().isoformat(), "error": str(e)})

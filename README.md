@@ -129,6 +129,32 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
   - `responses.jsonl`：后端 ASR 响应（JSON 行）
   - `metadata.json`：连接元数据（resource_id、backend_url、session_id、logid）
 
+#### 对话后端（SSE / JSON）
+
+- 默认对话后端：`DIALOG_URL=http://0.0.0.0:8084/chat/stream`
+- 模式选择：`DIALOG_MODE=sse`（默认）或 `json`
+- 语音风格：`VOICE_ID=demo-voice`（通过请求头 `X-Voice-Id` 传递，SSE 模式生效）
+- 前端可通过查询参数覆盖：
+  - `ws://<host>:8081/ws-asr?dialog_url=http://0.0.0.0:8084/chat/stream&dialog_mode=sse&voice_id=demo-voice`
+
+SSE 模式请求示例（与后端联调一致）：
+
+```
+curl -N -X POST "http://0.0.0.0:8084/chat/stream" \
+  -H "Accept: text/event-stream" \
+  -H "Content-Type: application/json" \
+  -H "X-Voice-Id: demo-voice" \
+  -d '{"input":"请用简短语气问候一下我","sessionId":"session-demo"}'
+```
+
+`.env` 示例（对话相关）：
+
+```
+DIALOG_URL=http://0.0.0.0:8084/chat/stream
+DIALOG_MODE=sse
+VOICE_ID=demo-voice
+```
+
 ### 前端消息协议
 
 - 文本消息（JSON）：
