@@ -137,6 +137,17 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
 - 前端可通过查询参数覆盖：
   - `ws://<host>:8081/ws-asr?dialog_url=http://0.0.0.0:8084/chat/stream&dialog_mode=sse&voice_id=demo-voice`
 
+断句与流式回复控制（可配置）：
+- 环境变量（或在初始化时传参覆盖）：
+  - `DIALOG_PUNCT_STRONG`：强标点集合（默认：`。！？!?….`）用于生成完整句
+  - `DIALOG_PUNCT_SOFT`：软标点集合（默认：`，、；;,`）用于在达到长度阈值时提前提交
+  - `DIALOG_AUTOF_FLUSH_LEN`：无标点时的自动提交长度阈值（默认：`12`）
+  - `DIALOG_SOFT_FLUSH_LEN`：软标点提前提交的最小长度（默认：`20`）
+  - `DIALOG_ENABLE_SOFT_SUBMIT`：是否启用软标点提前提交（默认：`true`）
+- 行为说明：
+  - ASR 识别文本按强标点自然断句提交到对话后端；若无强标点但达到软阈值，会按软标点在尾部切分提交；再无则按长度阈值兜底提交。
+  - SSE 回复解析出纯文本后，先在服务端按上述策略组句，再以 `type=dialog` 的增量消息推送到前端；结束时发送一次 `stream=false` 的最终汇总。
+
 SSE 模式请求示例（与后端联调一致）：
 
 ```
@@ -147,13 +158,17 @@ curl -N -X POST "http://0.0.0.0:8084/chat/stream" \
   -d '{"input":"请用简短语气问候一下我","sessionId":"session-demo"}'
 ```
 
-`.env` 示例（对话相关）：
+配置集中到 `.env` 文件：复制 `.env.example` 为 `.env`，然后按需修改。
 
-```
-DIALOG_URL=http://0.0.0.0:8084/chat/stream
-DIALOG_MODE=sse
-VOICE_ID=demo-voice
-```
+关键键：
+- `ASR_HOST` / `ASR_PORT`：服务监听地址与端口
+- `BACKEND_URL`：SAUC WebSocket 后端端点（默认 async）
+- `APP_KEY` / `ACCESS_KEY`：凭据（必填）
+- `RESOURCE_ID`：资源 ID（如 `volc.bigasr.sauc.duration`）
+- `DIALOG_URL` / `DIALOG_MODE` / `VOICE_ID` / `SYSTEM_PROMPT`：对话后端配置
+- `DIALOG_PUNCT_STRONG` / `DIALOG_PUNCT_SOFT` / `DIALOG_AUTOF_FLUSH_LEN` / `DIALOG_SOFT_FLUSH_LEN` / `DIALOG_ENABLE_SOFT_SUBMIT`：断句与流式提交控制
+
+说明：服务启动时自动加载 `.env`；前端可用查询参数临时覆盖（仅联调用）。
 
 ### 前端消息协议
 

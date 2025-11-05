@@ -42,7 +42,10 @@ class CompressionType:
 
 # 凭据读取（复用 sauc_websocket_demo.py 中的配置或环境变量）
 def load_env_file():
-    """从项目根目录加载 .env 并合并到环境变量（若存在）。"""
+    """
+    从项目根目录加载 .env 并合并到环境变量（若存在）。
+    - 跳过空行与注释；仅在当前环境未设置该键时注入值。
+    """
     env_path = Path(__file__).parent / '.env'
     if env_path.exists():
         try:
@@ -54,23 +57,18 @@ def load_env_file():
                     key, val = line.split('=', 1)
                     key = key.strip()
                     val = val.strip()
-                    # 若当前进程环境缺少该变量则注入
-                    if key and val and (key not in os.environ or not os.getenv(key)):
+                    if key and (key not in os.environ or os.getenv(key) is None or os.getenv(key) == ""):
                         os.environ[key] = val
         except Exception:
+            # 保持静默，避免影响服务启动
             pass
 
-# 先加载 .env，再读取环境变量或 demo 配置
+# 先加载 .env，再读取环境变量（不再依赖 demo 配置）
 load_env_file()
-try:
-    import sauc_websocket_demo as demo
-    APP_KEY = demo.config.app_key
-    ACCESS_KEY = demo.config.access_key
-    DEFAULT_RESOURCE_ID = demo.config.resource_id
-except Exception:
-    APP_KEY = os.getenv("APP_KEY", "")
-    ACCESS_KEY = os.getenv("ACCESS_KEY", "")
-    DEFAULT_RESOURCE_ID = os.getenv("RESOURCE_ID", "volc.bigasr.sauc.duration")
+APP_KEY = os.getenv("APP_KEY", "")
+ACCESS_KEY = os.getenv("ACCESS_KEY", "")
+DEFAULT_RESOURCE_ID = os.getenv("RESOURCE_ID", "volc.bigasr.sauc.duration")
+DEFAULT_BACKEND_URL = os.getenv("BACKEND_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async")
 
 # 对话服务配置（可通过环境变量或查询参数覆盖）
 DEFAULT_DIALOG_URL = os.getenv("DIALOG_URL", "http://0.0.0.0:8084/chat/stream")
@@ -443,8 +441,8 @@ class SaucSession:
 async def ws_asr_handler(request: web.Request):
     # 为后续赋值声明全局变量，避免 Python 作用域冲突
     global APP_KEY, ACCESS_KEY
-    # 参数：资源ID与后端URL可通过查询参数指定，否则使用默认
-    url = request.query.get('url', 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async')
+    # 参数：资源ID与后端URL可通过查询参数指定，否则使用默认（来自 .env）
+    url = request.query.get('url', DEFAULT_BACKEND_URL)
     resource_id = request.query.get('resource_id', DEFAULT_RESOURCE_ID)
     # 支持通过查询参数覆盖凭据（用于Linux服务进程没有环境变量时）
     app_key = request.query.get('app_key', APP_KEY)
@@ -557,7 +555,9 @@ def build_app():
 class DialogBridge:
     def __init__(self, session_id: str, dialog_url: str, http: aiohttp.ClientSession,
                  frontend_ws: web.WebSocketResponse, logger: logging.Logger,
-                 system_prompt: str, session_dir: str, dialog_mode: str = "sse", voice_id: str = "demo-voice"):
+                 system_prompt: str, session_dir: str, dialog_mode: str = "sse", voice_id: str = "demo-voice",
+                 strong_punct: str = None, soft_punct: str = None, soft_flush_min_chars: int = None,
+                 autoflush_min_chars: int = None, enable_soft_submit: bool = None):
         """
         对话桥接
         输入：
@@ -585,9 +585,13 @@ class DialogBridge:
         self.voice_id = voice_id or "demo-voice"
         self.buffer = ""  # 当前累计文本
         self.last_sent_index = 0  # 最近提交到对话的文本边界索引
-        # 断句规则：强标点 + 常用中文顿号/逗号/分号
-        # 注意：加入中文逗号可能带来更频繁的提交，但更贴近实时对话期待
-        self.re_punct = re.compile(r"[。！？!?…\.，、；;]+")
+        # 可配置断句：强/软标点集合与长度阈值（均可通过环境变量覆盖）
+        default_strong = os.getenv("DIALOG_PUNCT_STRONG", "。！？!?….")
+        default_soft = os.getenv("DIALOG_PUNCT_SOFT", "，、；;,")
+        self.strong_punct = (strong_punct or default_strong)
+        self.soft_punct = (soft_punct or default_soft)
+        self.re_strong = re.compile("[" + re.escape(self.strong_punct) + "]+")
+        self.re_soft = re.compile("[" + re.escape(self.soft_punct) + "]+")
         self.retry_max = 2
         self.usage_tokens = 0
         self.dialog_log_path = os.path.join(session_dir, 'dialog_events.jsonl')
@@ -596,9 +600,20 @@ class DialogBridge:
         self.frontend_dialog_log_path = os.path.join(session_dir, 'frontend_dialog.jsonl')
         # 自动提交的最小长度阈值（当无强标点、非最终包时避免长时间不提交）
         try:
-            self.autoflush_min_chars = int(os.getenv("DIALOG_AUTOF_FLUSH_LEN", "12"))
+            env_auto = int(os.getenv("DIALOG_AUTOF_FLUSH_LEN", "12"))
         except Exception:
-            self.autoflush_min_chars = 12
+            env_auto = 12
+        try:
+            env_soft = int(os.getenv("DIALOG_SOFT_FLUSH_LEN", "20"))
+        except Exception:
+            env_soft = 20
+        self.autoflush_min_chars = env_auto if autoflush_min_chars is None else int(autoflush_min_chars)
+        self.soft_flush_min_chars = env_soft if soft_flush_min_chars is None else int(soft_flush_min_chars)
+        if enable_soft_submit is None:
+            v = os.getenv("DIALOG_ENABLE_SOFT_SUBMIT", "true").lower()
+            self.enable_soft_submit = v in ("1", "true", "yes", "y")
+        else:
+            self.enable_soft_submit = bool(enable_soft_submit)
 
     def _extract_sse_text(self, data_str: str) -> str:
         """
@@ -688,6 +703,13 @@ class DialogBridge:
 
         # 若无标点拆分但文本已达到长度阈值，自动提交一次以便对话及时响应
         if not sentences:
+            # 尝试使用软标点尾部分割，在超过软阈值时提前提交
+            if self.enable_soft_submit and len(unsent) >= self.soft_flush_min_chars:
+                soft_seg = self._split_soft_tail(unsent)
+                if soft_seg:
+                    await self._submit_to_dialog(soft_seg)
+                    self.last_sent_index += len(soft_seg)
+            # 兜底：长度达到自动提交阈值或最终包
             tail_candidate = unsent.strip()
             if tail_candidate and (is_final or len(tail_candidate) >= self.autoflush_min_chars):
                 await self._submit_to_dialog(tail_candidate)
@@ -701,18 +723,42 @@ class DialogBridge:
                 self.last_sent_index = len(self.buffer)
 
     def _split_complete_sentences(self, text: str):
-        """将文本按强标点拆分为完整句子（保留标点）"""
+        """
+        将文本按强标点拆分为完整句子（保留标点）。
+        输入：text 文本
+        输出：句子列表（每个末尾包含强标点）
+        """
         if not text:
             return []
         out = []
         start = 0
-        for m in self.re_punct.finditer(text):
+        for m in self.re_strong.finditer(text):
             end = m.end()
             sent = text[start:end]
             if sent.strip():
                 out.append(sent)
             start = end
         return out
+
+    def _split_soft_tail(self, text: str) -> str:
+        """
+        在文本尾部查找最后一个软标点分界，返回可提交的片段（保留标点）。
+        条件：启用软提交且长度达到 soft_flush_min_chars。
+        输入：text 文本
+        输出：可提交的尾部片段字符串；若无合适分界返回空串
+        """
+        if not text or not self.enable_soft_submit:
+            return ""
+        if len(text) < self.soft_flush_min_chars:
+            return ""
+        last = None
+        for m in self.re_soft.finditer(text):
+            last = m
+        if last is None:
+            return ""
+        end = last.end()
+        seg = text[:end]
+        return seg.strip()
 
     async def _submit_to_dialog(self, sentence: str):
         """
@@ -776,10 +822,13 @@ class DialogBridge:
                                         continue
                                     buffer += text_piece
                                     full_reply.append(text_piece)
-                                    # 根据断句规则拆分完整句，分批发送到前端
+                                    # 根据断句规则拆分完整句（强标点），无则在软阈值下尝试软分割
                                     sentences = self._split_complete_sentences(buffer)
+                                    consumed = 0
+                                    if not sentences and self.enable_soft_submit and len(buffer) >= self.soft_flush_min_chars:
+                                        soft_seg = self._split_soft_tail(buffer)
+                                        sentences = [soft_seg] if soft_seg else []
                                     if sentences:
-                                        consumed = 0
                                         for seg in sentences:
                                             consumed += len(seg)
                                             out = {
@@ -924,8 +973,9 @@ class DialogBridge:
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Real-time ASR WebSocket Server (SAUC v3 bridge)')
-    parser.add_argument('--host', default='0.0.0.0')
-    parser.add_argument('--port', type=int, default=8081)
+    # 允许通过环境变量控制服务监听地址与端口（命令行可覆盖）
+    parser.add_argument('--host', default=os.getenv('ASR_HOST', '0.0.0.0'))
+    parser.add_argument('--port', type=int, default=int(os.getenv('ASR_PORT', '8081')))
     args = parser.parse_args()
     app = build_app()
     web.run_app(app, host=args.host, port=args.port)
