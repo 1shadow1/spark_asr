@@ -8,6 +8,7 @@ import uuid
 import logging
 import os
 import re
+import base64
 from datetime import datetime
 from pathlib import Path
 
@@ -75,6 +76,26 @@ DEFAULT_DIALOG_URL = os.getenv("DIALOG_URL", "http://0.0.0.0:8084/chat/stream")
 DEFAULT_DIALOG_MODE = os.getenv("DIALOG_MODE", "sse")  # 可选：sse 或 json
 DEFAULT_VOICE_ID = os.getenv("VOICE_ID", "demo-voice")
 DEFAULT_SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "你是一个礼貌且简洁的助手。")
+
+# 语音克隆 TTS 配置（默认关闭）
+def _env_bool(name: str, default_false: bool = True):
+    try:
+        val = os.getenv(name, "false" if default_false else "true")
+        return val.lower() in ("1", "true", "yes", "y")
+    except Exception:
+        return not default_false
+
+DEFAULT_VOICE_CLONE_ENABLED = _env_bool("VOICE_CLONE_ENABLED", default_false=True)
+DEFAULT_VOICE_CLONE_URL = os.getenv("VOICE_CLONE_URL", "")
+DEFAULT_VOICE_CLONE_MODE = os.getenv("VOICE_CLONE_MODE", "stream")  # stream 或 segments_http（预留）
+DEFAULT_VOICE_CLONE_VOICE_TYPE = os.getenv("VOICE_CLONE_VOICE_TYPE", "demo")
+DEFAULT_VOICE_CLONE_SEND_FINAL_ONLY = _env_bool("VOICE_CLONE_SEND_FINAL_ONLY", default_false=True)
+try:
+    DEFAULT_VOICE_CLONE_SAMPLE_RATE = int(os.getenv("VOICE_CLONE_SAMPLE_RATE", "24000"))
+except Exception:
+    DEFAULT_VOICE_CLONE_SAMPLE_RATE = 24000
+DEFAULT_VOICE_CLONE_SAVE_PATH = os.getenv("VOICE_CLONE_SAVE_PATH", "")
+DEFAULT_VOICE_CLONE_SAVE_MODE = os.getenv("VOICE_CLONE_SAVE_MODE", "append")
 
 # 结果文本提取
 def extract_final_text(payload_msg):
@@ -484,6 +505,19 @@ async def ws_asr_handler(request: web.Request):
     voice_id = request.query.get('voice_id', DEFAULT_VOICE_ID)
     system_prompt = request.query.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
 
+    # 语音克隆 TTS 接入（允许查询参数覆盖）
+    voice_clone_enabled = (request.query.get('voice_clone_enabled', str(DEFAULT_VOICE_CLONE_ENABLED)).lower() in ("1", "true", "yes", "y"))
+    voice_clone_url = request.query.get('voice_clone_url', DEFAULT_VOICE_CLONE_URL)
+    voice_clone_mode = request.query.get('voice_clone_mode', DEFAULT_VOICE_CLONE_MODE)
+    voice_clone_voice_type = request.query.get('voice_clone_voice_type', DEFAULT_VOICE_CLONE_VOICE_TYPE)
+    voice_clone_send_final_only = (request.query.get('voice_clone_send_final_only', str(DEFAULT_VOICE_CLONE_SEND_FINAL_ONLY)).lower() in ("1", "true", "yes", "y"))
+    try:
+        voice_clone_sample_rate = int(request.query.get('voice_clone_sample_rate', str(DEFAULT_VOICE_CLONE_SAMPLE_RATE)))
+    except Exception:
+        voice_clone_sample_rate = DEFAULT_VOICE_CLONE_SAMPLE_RATE
+    voice_clone_save_path = request.query.get('voice_clone_save_path', DEFAULT_VOICE_CLONE_SAVE_PATH)
+    voice_clone_save_mode = request.query.get('voice_clone_save_mode', DEFAULT_VOICE_CLONE_SAVE_MODE)
+
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
@@ -491,16 +525,21 @@ async def ws_asr_handler(request: web.Request):
     loop = asyncio.get_event_loop()
     # 运行时凭据校验与友好错误返回
     if not app_key or not access_key or not resource_id:
+        # 注意：避免对同一个 request 重复调用 prepare。
+        # 这里复用已 prepare 的 ws，直接发送错误并关闭；或者返回 HTTP 错误响应。
         err = {
             "type": "error",
             "session_id": session_id,
             "message": "missing credentials: app_key/access_key/resource_id",
         }
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        await ws.send_str(json.dumps(err))
-        await ws.close()
-        return ws
+        try:
+            # 如果已完成握手，则通过 WS 返回错误并关闭
+            await ws.send_str(json.dumps(err))
+            await ws.close()
+            return ws
+        except Exception:
+            # 若握手未完成或失败，则返回 JSON 错误响应
+            return web.json_response(err, status=400)
 
     # 将凭据注入全局（简化后续 connect_backend 使用）
     APP_KEY = app_key
@@ -520,6 +559,15 @@ async def ws_asr_handler(request: web.Request):
         session_dir=session.base_dir,
         dialog_mode=dialog_mode,
         voice_id=voice_id,
+        # 语音克隆 TTS 配置注入
+        voice_clone_enabled=voice_clone_enabled,
+        voice_clone_url=voice_clone_url,
+        voice_clone_mode=voice_clone_mode,
+        voice_clone_voice_type=voice_clone_voice_type,
+        voice_clone_send_final_only=voice_clone_send_final_only,
+        voice_clone_sample_rate=voice_clone_sample_rate,
+        voice_clone_save_path=voice_clone_save_path,
+        voice_clone_save_mode=voice_clone_save_mode,
     )
     recv_task = asyncio.create_task(session.recv_loop(ws))
 
@@ -589,7 +637,16 @@ class DialogBridge:
                  frontend_ws: web.WebSocketResponse, logger: logging.Logger,
                  system_prompt: str, session_dir: str, dialog_mode: str = "sse", voice_id: str = "demo-voice",
                  strong_punct: str = None, soft_punct: str = None, soft_flush_min_chars: int = None,
-                 autoflush_min_chars: int = None, enable_soft_submit: bool = None):
+                 autoflush_min_chars: int = None, enable_soft_submit: bool = None,
+                 # 语音克隆 TTS 配置
+                 voice_clone_enabled: bool = False,
+                 voice_clone_url: str = "",
+                 voice_clone_mode: str = "stream",
+                 voice_clone_voice_type: str = "demo",
+                 voice_clone_send_final_only: bool = False,
+                 voice_clone_sample_rate: int = 24000,
+                 voice_clone_save_path: str = "",
+                 voice_clone_save_mode: str = "append"):
         """
         对话桥接
         输入：
@@ -646,6 +703,21 @@ class DialogBridge:
             self.enable_soft_submit = v in ("1", "true", "yes", "y")
         else:
             self.enable_soft_submit = bool(enable_soft_submit)
+
+        # 语音克隆 TTS 配置与前端音频日志
+        # 说明：当启用语音克隆时，我们会在每个 reply 段（stream=true）与最终回复（stream=false）
+        # 异步调用 TTS 服务，并将返回的 MP3 按到达顺序以 Base64 分片推送到前端。
+        self.voice_clone_enabled = bool(voice_clone_enabled)
+        self.voice_clone_url = voice_clone_url or ""
+        self.voice_clone_mode = (voice_clone_mode or "stream").lower()
+        self.voice_clone_voice_type = voice_clone_voice_type or "demo"
+        self.voice_clone_send_final_only = bool(voice_clone_send_final_only)
+        self.voice_clone_sample_rate = int(voice_clone_sample_rate or 24000)
+        self.voice_clone_save_path = voice_clone_save_path or ""
+        self.voice_clone_save_mode = (voice_clone_save_mode or "append").lower()
+        # 前端音频日志路径与片段序号（单调递增）
+        self.frontend_audio_log_path = os.path.join(session_dir, 'frontend_audio.jsonl')
+        self.audio_seq = 1
 
     def _extract_sse_text(self, data_str: str) -> str:
         """
@@ -881,6 +953,12 @@ class DialogBridge:
                                                 "t": datetime.now().isoformat(),
                                                 "data": out,
                                             })
+                                            # 触发语音克隆（增量段），按配置控制
+                                            if self.voice_clone_enabled and not self.voice_clone_send_final_only and self.voice_clone_url:
+                                                try:
+                                                    asyncio.create_task(self._emit_tts(seg))
+                                                except Exception:
+                                                    pass
                                         # 截断已发送的部分，保留尾部未成句文本
                                         buffer = buffer[consumed:]
                         # 汇总发送最终结果（保留兼容：发送完整回复）
@@ -903,6 +981,12 @@ class DialogBridge:
                             "t": datetime.now().isoformat(),
                             "data": out,
                         })
+                        # 最终回复触发语音克隆
+                        if self.voice_clone_enabled and self.voice_clone_url:
+                            try:
+                                asyncio.create_task(self._emit_tts(final))
+                            except Exception:
+                                pass
                         self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": {"reply": final, "mode": "sse"}})
                         return
                 else:
@@ -951,6 +1035,12 @@ class DialogBridge:
                             "t": datetime.now().isoformat(),
                             "data": out,
                         })
+                        # JSON 模式下也触发语音克隆（按配置）
+                        if self.voice_clone_enabled and self.voice_clone_url:
+                            try:
+                                asyncio.create_task(self._emit_tts(reply))
+                            except Exception:
+                                pass
                         self._append_dialog_log({"type": "dialog_response", "t": datetime.now().isoformat(), "data": data})
                         return
             except Exception as e:
@@ -988,6 +1078,359 @@ class DialogBridge:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    def _append_frontend_audio(self, item: dict):
+        """
+        记录返回给前端的音频消息（JSON 行）。
+        输入：消息字典（包含 type=audio / session_id / seq / stream / data_b64 等）
+        输出：无（落盘到 frontend_audio.jsonl）
+        """
+        try:
+            with open(self.frontend_audio_log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    async def _emit_tts(self, text: str):
+        """
+        语音克隆入口：根据配置的 voice_clone_mode 调用不同的 TTS 方式。
+        输入：text 文本
+        输出：无（将返回的音频分片或错误信息推送到前端，并记录到 frontend_audio.jsonl）
+        逻辑：
+        - 当 voice_clone_mode == 'segments_http' 时，调用基于 NDJSON 的 /api/tts/stream_segments
+        - 其他情况（默认）使用 JSON 的单次文本直流式 /api/tts/stream
+        """
+        if not (self.voice_clone_enabled and self.voice_clone_url and text):
+            return
+        mode = (self.voice_clone_mode or 'stream').lower()
+        if mode == 'segments_http':
+            await self._emit_tts_http_stream_segments(text)
+        else:
+            await self._emit_tts_http_stream(text)
+
+    async def _emit_tts_http_stream(self, text: str):
+        """
+        调用语音克隆 TTS（HTTP 单次文本直流式），将返回的 MP3 音频分片推送到前端。
+        输入：text 文本
+        输出：无（逐片以 Base64 发送到前端并记录日志）
+        行为：
+        - 仅在 voice_clone_enabled 为 True 且 voice_clone_url 非空时执行
+        - 请求体使用下划线字段：{"text": ..., "session_id": ..., "voice_type": ..., "save_path": ...}
+        - 当返回 Content-Type=audio/mpeg 时，按到达顺序逐块读取并发送
+        - 当返回 application/json 时，视为错误，解析后记录并向前端发送错误消息
+        """
+        if not (self.voice_clone_enabled and self.voice_clone_url and text):
+            return
+        # 记录一次调用尝试（便于会话级排查）
+        try:
+            self.logger.info(f"TTS start: url={self.voice_clone_url}, text_len={len(text)}, voice_type={self.voice_clone_voice_type}")
+        except Exception:
+            pass
+        body = {"text": text, "session_id": self.session_id}
+        if self.voice_clone_voice_type:
+            body["voice_type"] = self.voice_clone_voice_type
+        if self.voice_clone_save_path:
+            body["save_path"] = self.voice_clone_save_path
+        headers = {"Content-Type": "application/json"}
+        try:
+            async with self.http.post(self.voice_clone_url, json=body, headers=headers, timeout=60) as resp:
+                ctype = (resp.headers.get('Content-Type') or '').lower()
+                ok = (resp.status // 100) == 2
+                if not ok:
+                    err_msg = None
+                    try:
+                        err_json = await resp.json()
+                        err_msg = json.dumps(err_json, ensure_ascii=False)
+                    except Exception:
+                        err_msg = await resp.text()
+                    if not self.frontend_ws.closed:
+                        try:
+                            await self.frontend_ws.send_str(json.dumps({
+                                "type": "error",
+                                "session_id": self.session_id,
+                                "message": f"TTS HTTP {resp.status}: {err_msg}",
+                            }, ensure_ascii=False))
+                        except Exception:
+                            pass
+                    # 记录错误（JSON 尝试）
+                    self._append_frontend_audio({
+                        "t": datetime.now().isoformat(),
+                        "error": True,
+                        "status": resp.status,
+                        "message": err_msg,
+                        "attempt": "json",
+                    })
+                    # 尝试回退为 text/plain 纯文本提交（部分 TTS 服务不接受 JSON）
+                    try:
+                        await self._emit_tts_http_stream_fallback_text(text)
+                    except Exception:
+                        pass
+                    return
+                if 'audio/mpeg' in ctype:
+                    async for chunk, _ in resp.content.iter_chunks():
+                        if not chunk:
+                            continue
+                        try:
+                            b64 = base64.b64encode(chunk).decode('ascii')
+                        except Exception:
+                            continue
+                        out = {
+                            "type": "audio",
+                            "session_id": self.session_id,
+                            "seq": self.audio_seq,
+                            "stream": True,
+                            "mime": "audio/mpeg",
+                            "sample_rate": self.voice_clone_sample_rate,
+                            "data_b64": b64,
+                        }
+                        self.audio_seq += 1
+                        if not self.frontend_ws.closed:
+                            try:
+                                await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                            except Exception:
+                                pass
+                        self._append_frontend_audio({
+                            "t": datetime.now().isoformat(),
+                            "data": out,
+                        })
+                    return
+                else:
+                    err_msg = None
+                    try:
+                        err_json = await resp.json()
+                        err_msg = json.dumps(err_json, ensure_ascii=False)
+                    except Exception:
+                        err_msg = await resp.text()
+                    if not self.frontend_ws.closed:
+                        try:
+                            await self.frontend_ws.send_str(json.dumps({
+                                "type": "error",
+                                "session_id": self.session_id,
+                                "message": f"TTS content-type not audio/mpeg: {ctype}; detail: {err_msg}",
+                            }, ensure_ascii=False))
+                        except Exception:
+                            pass
+                    self._append_frontend_audio({
+                        "t": datetime.now().isoformat(),
+                        "error": True,
+                        "status": resp.status,
+                        "message": f"ctype={ctype}; {err_msg}",
+                        "attempt": "json",
+                    })
+                    # 同样回退一次纯文本提交
+                    try:
+                        await self._emit_tts_http_stream_fallback_text(text)
+                    except Exception:
+                        pass
+        except Exception as e:
+            if not self.frontend_ws.closed:
+                try:
+                    await self.frontend_ws.send_str(json.dumps({
+                        "type": "error",
+                        "session_id": self.session_id,
+                        "message": f"TTS request failed: {e}",
+                    }, ensure_ascii=False))
+                except Exception:
+                    pass
+            self._append_frontend_audio({
+                "t": datetime.now().isoformat(),
+                "error": True,
+                "message": str(e),
+            })
+
+    async def _emit_tts_http_stream_segments(self, text: str):
+        """
+        调用语音克隆 TTS（HTTP NDJSON 段式，/api/tts/stream_segments），将返回的 MP3 音频分片推送到前端。
+        输入：text 文本
+        输出：无（逐片以 Base64 发送到前端并记录日志）
+        行为：
+        - 请求体使用 NDJSON（一行一条 JSON）：{"text": "..."}\n
+        - 通过 query 传递 session_id、voice_type、save_path、save_mode（若配置提供）
+        - 当返回 Content-Type=audio/mpeg 时，按到达顺序逐块读取并发送
+        - 非 audio/mpeg 时，记录错误并落盘
+        """
+        if not (self.voice_clone_enabled and self.voice_clone_url and text):
+            return
+        try:
+            self.logger.info(f"TTS segments start: url={self.voice_clone_url}, text_len={len(text)}, voice_type={self.voice_clone_voice_type}")
+        except Exception:
+            pass
+        # NDJSON 一行
+        line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
+        data = line.encode('utf-8')
+        params = {}
+        if self.session_id:
+            params["session_id"] = self.session_id
+        if self.voice_clone_voice_type:
+            params["voice_type"] = self.voice_clone_voice_type
+        if self.voice_clone_save_path:
+            params["save_path"] = self.voice_clone_save_path
+        if self.voice_clone_save_mode:
+            params["save_mode"] = self.voice_clone_save_mode
+        headers = {"Content-Type": "application/x-ndjson"}
+        try:
+            async with self.http.post(self.voice_clone_url, params=params, data=data, headers=headers, timeout=60) as resp:
+                ctype = (resp.headers.get('Content-Type') or '').lower()
+                ok = (resp.status // 100) == 2
+                if not ok:
+                    msg = None
+                    try:
+                        msg = await resp.text()
+                    except Exception:
+                        msg = f"HTTP {resp.status}"
+                    if not self.frontend_ws.closed:
+                        try:
+                            await self.frontend_ws.send_str(json.dumps({
+                                "type": "error",
+                                "session_id": self.session_id,
+                                "message": f"TTS segments HTTP {resp.status}: {msg}",
+                            }, ensure_ascii=False))
+                        except Exception:
+                            pass
+                    self._append_frontend_audio({
+                        "t": datetime.now().isoformat(),
+                        "error": True,
+                        "status": resp.status,
+                        "message": msg,
+                        "attempt": "segments_http",
+                    })
+                    return
+                if 'audio/mpeg' in ctype:
+                    async for chunk, _ in resp.content.iter_chunks():
+                        if not chunk:
+                            continue
+                        try:
+                            b64 = base64.b64encode(chunk).decode('ascii')
+                        except Exception:
+                            continue
+                        out = {
+                            "type": "audio",
+                            "session_id": self.session_id,
+                            "seq": self.audio_seq,
+                            "stream": True,
+                            "mime": "audio/mpeg",
+                            "sample_rate": self.voice_clone_sample_rate,
+                            "data_b64": b64,
+                        }
+                        self.audio_seq += 1
+                        if not self.frontend_ws.closed:
+                            try:
+                                await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                            except Exception:
+                                pass
+                        self._append_frontend_audio({
+                            "t": datetime.now().isoformat(),
+                            "data": out,
+                        })
+                else:
+                    msg = None
+                    try:
+                        msg = await resp.text()
+                    except Exception:
+                        msg = f"content-type={ctype}"
+                    if not self.frontend_ws.closed:
+                        try:
+                            await self.frontend_ws.send_str(json.dumps({
+                                "type": "error",
+                                "session_id": self.session_id,
+                                "message": f"TTS segments content-type not audio/mpeg: {ctype}; detail: {msg}",
+                            }, ensure_ascii=False))
+                        except Exception:
+                            pass
+                    self._append_frontend_audio({
+                        "t": datetime.now().isoformat(),
+                        "error": True,
+                        "status": resp.status,
+                        "message": f"ctype={ctype}; {msg}",
+                        "attempt": "segments_http",
+                    })
+        except Exception as e:
+            if not self.frontend_ws.closed:
+                try:
+                    await self.frontend_ws.send_str(json.dumps({
+                        "type": "error",
+                        "session_id": self.session_id,
+                        "message": f"TTS segments request failed: {e}",
+                    }, ensure_ascii=False))
+                except Exception:
+                    pass
+            self._append_frontend_audio({
+                "t": datetime.now().isoformat(),
+                "error": True,
+                "message": str(e),
+                "attempt": "segments_http",
+            })
+
+    async def _emit_tts_http_stream_fallback_text(self, text: str):
+        """
+        回退方案：以 text/plain 提交纯文本，兼容不支持 JSON 的 TTS 服务。
+        输入：text 文本
+        输出：若返回 audio/mpeg，则按流式分片推送；否则记录错误。
+        """
+        try:
+            if not (self.voice_clone_enabled and self.voice_clone_url and text):
+                return
+            try:
+                self.logger.info(f"TTS fallback(text/plain) start: url={self.voice_clone_url}, text_len={len(text)}")
+            except Exception:
+                pass
+            headers = {"Content-Type": "text/plain"}
+            async with self.http.post(self.voice_clone_url, data=text.encode('utf-8'), headers=headers, timeout=60) as resp:
+                ctype = (resp.headers.get('Content-Type') or '').lower()
+                ok = (resp.status // 100) == 2
+                if not ok:
+                    msg = await resp.text()
+                    self._append_frontend_audio({
+                        "t": datetime.now().isoformat(),
+                        "error": True,
+                        "status": resp.status,
+                        "message": msg,
+                        "attempt": "text/plain",
+                    })
+                    return
+                if 'audio/mpeg' in ctype:
+                    async for chunk, _ in resp.content.iter_chunks():
+                        if not chunk:
+                            continue
+                        try:
+                            b64 = base64.b64encode(chunk).decode('ascii')
+                        except Exception:
+                            continue
+                        out = {
+                            "type": "audio",
+                            "session_id": self.session_id,
+                            "seq": self.audio_seq,
+                            "stream": True,
+                            "mime": "audio/mpeg",
+                            "sample_rate": self.voice_clone_sample_rate,
+                            "data_b64": b64,
+                        }
+                        self.audio_seq += 1
+                        if not self.frontend_ws.closed:
+                            try:
+                                await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                            except Exception:
+                                pass
+                        self._append_frontend_audio({
+                            "t": datetime.now().isoformat(),
+                            "data": out,
+                        })
+                else:
+                    msg = await resp.text()
+                    self._append_frontend_audio({
+                        "t": datetime.now().isoformat(),
+                        "error": True,
+                        "status": resp.status,
+                        "message": f"ctype={ctype}; {msg}",
+                        "attempt": "text/plain",
+                    })
+        except Exception as e:
+            self._append_frontend_audio({
+                "t": datetime.now().isoformat(),
+                "error": True,
+                "message": f"fallback text/plain failed: {e}",
+                "attempt": "text/plain",
+            })
 
     def _append_frontend_dialog(self, item: dict):
         """记录返回给前端的 type=dialog 消息（JSON 行）。"""

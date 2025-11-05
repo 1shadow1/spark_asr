@@ -192,6 +192,77 @@ curl -N -X POST "http://0.0.0.0:8084/chat/stream" \
 - 错误消息：
   - `{ "type": "error", "session_id": "...", "message": "..." }`
 
+#### 音频消息（当启用语音克隆 TTS 时）
+
+- 当对话后端返回 `reply` 时，服务端会将文本提交至语音克隆 TTS，并把返回的 MP3 音频以追加模式推送到前端：
+  - `{ "type": "audio", "session_id": "...", "seq": <int>, "stream": true, "mime": "audio/mpeg", "sample_rate": 24000, "data_b64": "<Base64 MP3 bytes>" }`
+  - `seq` 为服务端单调递增的分片编号；`data_b64` 是 MP3 字节的 Base64 编码。
+  - 前端收到后请按 `seq` 追加播放；音频片段不包含序号，需以到达顺序组织。
+
+### 语音克隆 TTS 集成
+
+- 配置（均可在 `.env` 中设置或通过查询参数覆盖）：
+  - `VOICE_CLONE_ENABLED`：是否启用 TTS（`true/false`）
+  - `VOICE_CLONE_URL`：TTS HTTP 入口（推荐 `/api/tts/stream`，返回 `audio/mpeg`）
+  - `VOICE_CLONE_MODE`：`stream`（单次文本直流，推荐）或 `segments_http`（预留）
+  - `VOICE_CLONE_VOICE_TYPE`：说话人/风格标识（由 TTS 服务定义）
+  - `VOICE_CLONE_SEND_FINAL_ONLY`：仅在最终回复触发 TTS（增量不触发）
+  - `VOICE_CLONE_SAMPLE_RATE`：用于消息标注的采样率（MP3 默认 24kHz）
+  - `VOICE_CLONE_SAVE_PATH` / `VOICE_CLONE_SAVE_MODE`：可选，透传给 TTS 服务侧保存（本服务不落盘原始音频）
+
+- 运行示例（使用查询参数启用 TTS）：
+
+```
+ws://<host>:8081/ws-asr?
+  dialog_url=http://0.0.0.0:8084/chat/stream&
+  dialog_mode=sse&
+  voice_id=demo-voice&
+  voice_clone_enabled=true&
+  voice_clone_url=http://0.0.0.0:8085/api/tts/stream&
+  voice_clone_voice_type=demo
+```
+
+- 后端将以 `type=dialog` 推送文本回复；若启用 TTS，则并行以 `type=audio` 推送 MP3 片段（Base64）。
+
+### 快速联调与运维命令（Linux）
+
+- 初始化环境文件（幂等、带确认）：
+
+```bash
+# 进入项目目录
+cd /srv/spark_asr
+
+# 若不存在 .env，则从示例复制
+if [ ! -f .env ]; then
+  cp -v .env.example .env || { echo "复制 .env 失败"; exit 1; }
+fi
+
+# 写入必要的键（保留已有值），并启用语音克隆
+grep -q '^APP_KEY=' .env || echo 'APP_KEY=' >> .env
+grep -q '^ACCESS_KEY=' .env || echo 'ACCESS_KEY=' >> .env
+grep -q '^RESOURCE_ID=' .env || echo 'RESOURCE_ID=volc.bigasr.sauc.duration' >> .env
+
+# 设置/更新 TTS 相关键（覆盖写入）
+sed -i 's/^VOICE_CLONE_ENABLED=.*/VOICE_CLONE_ENABLED=true/' .env
+sed -i 's#^VOICE_CLONE_URL=.*#VOICE_CLONE_URL=http://0.0.0.0:8085/api/tts/stream#' .env
+sed -i 's/^VOICE_CLONE_VOICE_TYPE=.*/VOICE_CLONE_VOICE_TYPE=demo/' .env
+
+echo "当前 .env 生效的关键键："
+grep -E '^(APP_KEY|ACCESS_KEY|RESOURCE_ID|VOICE_CLONE_)' .env | sed 's/.*/  &/'
+```
+
+- 启动服务并观察日志：
+
+```bash
+python sauc_asr_server.py --host 0.0.0.0 --port 8081
+# 浏览器或前端连接：ws://<host>:8081/ws-asr?voice_clone_enabled=true&voice_clone_url=http://0.0.0.0:8085/api/tts/stream
+```
+
+- 会话日志目录：`./sessions/<YYYYMMDD>/<session_id>/`
+  - `frontend_dialog.jsonl`：推送给前端的 `type=dialog` 文本消息
+  - `frontend_audio.jsonl`：推送给前端的 `type=audio` 音频消息（Base64 片段和元信息）
+  - `session.log`：会话级日志；`responses.jsonl`：ASR 后端响应记录
+
 ### 前端示例（浏览器）
 
 以下示例展示如何使用 WebAudio 将麦克风采集的音频转换为 PCM16 并通过 WebSocket 发送到服务端（示意代码，需根据实际环境调整）：
