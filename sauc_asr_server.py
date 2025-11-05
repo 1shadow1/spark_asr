@@ -225,6 +225,7 @@ class SaucSession:
         fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         self.session_logger.addHandler(fh)
         self.responses_path = os.path.join(base_dir, 'responses.jsonl')
+        self.frontend_result_log_path = os.path.join(base_dir, 'frontend_result.jsonl')
         # 保存元数据
         meta = {
             "session_id": session_id,
@@ -383,6 +384,12 @@ class SaucSession:
                         self.session_logger.error(f"Forwarding to frontend failed: {e}")
                         break
 
+                    # 记录返回给前端的 ASR result 消息
+                    self._append_frontend_result({
+                        "t": datetime.now().isoformat(),
+                        "data": out,
+                    })
+
                     # 将识别更新交由对话桥处理（提交断句到后端对话服务）
                     if self.dialog_bridge is not None:
                         try:
@@ -413,6 +420,17 @@ class SaucSession:
         with open(self.responses_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(resp.to_dict(), ensure_ascii=False) + "\n")
         self.session_logger.info(f"Backend resp: {resp.to_dict()}")
+
+    def _append_frontend_result(self, item: dict):
+        """记录返回给前端的 type=result 消息（JSON 行）。
+        输入：item 字典，包含时间戳和完整消息内容
+        输出：写入会话目录下 frontend_result.jsonl 文件
+        """
+        try:
+            with open(self.frontend_result_log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     async def close(self):
         try:
@@ -582,6 +600,64 @@ class DialogBridge:
         except Exception:
             self.autoflush_min_chars = 12
 
+    def _extract_sse_text(self, data_str: str) -> str:
+        """
+        解析 SSE 的 data 内容，提取可显示的纯文本。
+        输入：data_str 原始字符串（可能是 JSON、多个 JSON 拼接，或纯文本）
+        输出：提取出的文本（若无法提取则返回空字符串）
+        处理策略：
+        - 优先按 JSON 解析，常见键：text、delta、content、reply
+        - 若解析失败，尝试兼容多个 JSON 拼接（通过正则提取所有 "text" 字段）
+        - 忽略仅含 requestId/sessionId 等非文本字段的片段
+        - 兼容纯文本直接返回
+        """
+        if not data_str:
+            return ""
+        s = data_str.strip()
+        # 常见结束标记
+        if s.upper() in {"[DONE]", "DONE"}:
+            return ""
+        # 先尝试标准 JSON
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                for key in ("text", "delta", "content", "reply"):
+                    val = obj.get(key)
+                    if isinstance(val, str):
+                        return val
+                # OpenAI 风格：choices[0].delta.content
+                choices = obj.get("choices")
+                if isinstance(choices, list) and choices:
+                    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                    if isinstance(delta, dict):
+                        v = delta.get("content") or delta.get("text")
+                        if isinstance(v, str):
+                            return v
+                return ""
+        except Exception:
+            pass
+
+        # 兼容多个 JSON 在同一个 data 内拼接，比如 `}{` 连续的情况
+        try:
+            # 通过正则提取所有 "text": "..." 片段
+            texts = re.findall(r'"text"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', s)
+            if texts:
+                # 还原转义字符
+                cleaned = "".join([bytes(t, 'utf-8').decode('unicode_escape') for t in texts])
+                return cleaned
+            # 其次提取 content/delta 作为备用
+            contents = re.findall(r'"content"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', s)
+            if contents:
+                cleaned = "".join([bytes(t, 'utf-8').decode('unicode_escape') for t in contents])
+                return cleaned
+        except Exception:
+            pass
+
+        # 作为最后兜底，若看起来是纯文本（不含明显 JSON 结构），直接返回
+        if not ("{" in s and "}" in s):
+            return s
+        return ""
+
     async def on_recognition_update(self, text: str, is_final: bool):
         """
         处理识别增量更新
@@ -673,41 +749,60 @@ class DialogBridge:
                         if (resp.status // 100) != 2:
                             text = await resp.text()
                             raise RuntimeError(f"Dialog SSE HTTP {resp.status}: {text}")
-                        # 逐块读取 SSE
+                        # 逐块读取 SSE：维护行缓冲，提取纯文本，断句后推送前端
                         full_reply = []
+                        buffer = ""
+                        line_buf = ""  # SSE 行缓冲，避免半行导致解析异常
                         async for chunk, _ in resp.content.iter_chunks():
                             try:
-                                line = chunk.decode('utf-8', errors='ignore')
+                                decoded = chunk.decode('utf-8', errors='ignore')
                             except Exception:
                                 continue
-                            for raw in line.splitlines():
-                                s = raw.strip()
-                                if not s:
+                            if not decoded:
+                                continue
+                            line_buf += decoded
+                            # 按行处理，保留最后一段残缺到下一轮
+                            while True:
+                                if "\n" not in line_buf:
+                                    break
+                                ln, line_buf = line_buf.split("\n", 1)
+                                sline = ln.strip()
+                                if not sline:
                                     continue
-                                # 常见格式：data: <payload>
-                                if s.startswith('data:'):
-                                    data_str = s[5:].strip()
-                                    # 直接转发增量文本（不强制要求 JSON）
-                                    out = {
-                                        "type": "dialog",
-                                        "session_id": self.session_id,
-                                        "user_sentence": sentence,
-                                        "reply": data_str,
-                                        "usage": {},
-                                        "stream": True,
-                                    }
-                                    if not self.frontend_ws.closed:
-                                        try:
-                                            await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
-                                        except Exception:
-                                            pass
-                                    # 记录返回给前端的对话增量消息
-                                    self._append_frontend_dialog({
-                                        "t": datetime.now().isoformat(),
-                                        "data": out,
-                                    })
-                                    full_reply.append(data_str)
-                        # 汇总发送最终结果
+                                if sline.startswith('data:'):
+                                    payload = sline[5:].strip()
+                                    text_piece = self._extract_sse_text(payload)
+                                    if not text_piece:
+                                        continue
+                                    buffer += text_piece
+                                    full_reply.append(text_piece)
+                                    # 根据断句规则拆分完整句，分批发送到前端
+                                    sentences = self._split_complete_sentences(buffer)
+                                    if sentences:
+                                        consumed = 0
+                                        for seg in sentences:
+                                            consumed += len(seg)
+                                            out = {
+                                                "type": "dialog",
+                                                "session_id": self.session_id,
+                                                "user_sentence": sentence,
+                                                "reply": seg,
+                                                "usage": {},
+                                                "stream": True,
+                                            }
+                                            if not self.frontend_ws.closed:
+                                                try:
+                                                    await self.frontend_ws.send_str(json.dumps(out, ensure_ascii=False))
+                                                except Exception:
+                                                    pass
+                                            # 记录返回给前端的对话增量消息
+                                            self._append_frontend_dialog({
+                                                "t": datetime.now().isoformat(),
+                                                "data": out,
+                                            })
+                                        # 截断已发送的部分，保留尾部未成句文本
+                                        buffer = buffer[consumed:]
+                        # 汇总发送最终结果（保留兼容：发送完整回复）
                         final = "".join(full_reply).strip()
                         out = {
                             "type": "dialog",
