@@ -167,8 +167,14 @@ curl -N -X POST "http://0.0.0.0:8084/chat/stream" \
 - `RESOURCE_ID`：资源 ID（如 `volc.bigasr.sauc.duration`）
 - `DIALOG_URL` / `DIALOG_MODE` / `VOICE_ID` / `SYSTEM_PROMPT`：对话后端配置
 - `DIALOG_PUNCT_STRONG` / `DIALOG_PUNCT_SOFT` / `DIALOG_AUTOF_FLUSH_LEN` / `DIALOG_SOFT_FLUSH_LEN` / `DIALOG_ENABLE_SOFT_SUBMIT`：断句与流式提交控制
+ - `RESULT_DEDUP` / `RESULT_MIN_DELTA` / `RESULT_DEBOUNCE_MS`：ASR 增量去重与节流（减少重复文本）
 
 说明：服务启动时自动加载 `.env`；前端可用查询参数临时覆盖（仅联调用）。
+
+去重与节流行为：
+- `RESULT_DEDUP=true`：当 `final=false` 且文本与上次相同，抑制输出（仍保留最终结果与对话桥更新）。
+- `RESULT_MIN_DELTA`：变化字符数小于该阈值时抑制输出（默认 0 表示不启用）。
+- `RESULT_DEBOUNCE_MS`：时间窗口内（毫秒）相同文本只保留一次（默认 0 表示不启用）。
 
 ### 前端消息协议
 

@@ -224,6 +224,21 @@ class SaucSession:
         self.session_logger.addHandler(fh)
         self.responses_path = os.path.join(base_dir, 'responses.jsonl')
         self.frontend_result_log_path = os.path.join(base_dir, 'frontend_result.jsonl')
+        # 去重/节流配置与状态
+        try:
+            self.result_dedup = (os.getenv("RESULT_DEDUP", "true").lower() in ("1", "true", "yes", "y"))
+        except Exception:
+            self.result_dedup = True
+        try:
+            self.result_min_delta = int(os.getenv("RESULT_MIN_DELTA", "0"))
+        except Exception:
+            self.result_min_delta = 0
+        try:
+            self.result_debounce_ms = int(os.getenv("RESULT_DEBOUNCE_MS", "0"))
+        except Exception:
+            self.result_debounce_ms = 0
+        self._last_text = ""
+        self._last_emit_ts = 0
         # 保存元数据
         meta = {
             "session_id": session_id,
@@ -367,6 +382,20 @@ class SaucSession:
                         "text": text,
                         "logid": self.logid,
                     }
+                    # 无变化抑制与最小变化阈值/节流
+                    if not final and self.result_dedup:
+                        now_ms = int(datetime.now().timestamp() * 1000)
+                        same = (text == self._last_text)
+                        small_change = (not same and self.result_min_delta > 0 and abs(len(text) - len(self._last_text)) < self.result_min_delta)
+                        within_debounce = (self.result_debounce_ms > 0 and (now_ms - self._last_emit_ts) < self.result_debounce_ms and same)
+                        if same or small_change or within_debounce:
+                            # 跳过发送与记录，但仍让对话桥收到最新文本以便断句累积
+                            if self.dialog_bridge is not None:
+                                try:
+                                    await self.dialog_bridge.on_recognition_update(text or "", final)
+                                except Exception as e:
+                                    self.session_logger.error(f"DialogBridge handling failed (dedup path): {e}")
+                            continue
                     # 前端已关闭则停止发送
                     if frontend_ws.closed:
                         self.session_logger.warning("Frontend WS closed; stop forwarding")
@@ -387,6 +416,9 @@ class SaucSession:
                         "t": datetime.now().isoformat(),
                         "data": out,
                     })
+                    # 更新去重状态
+                    self._last_text = text
+                    self._last_emit_ts = int(datetime.now().timestamp() * 1000)
 
                     # 将识别更新交由对话桥处理（提交断句到后端对话服务）
                     if self.dialog_bridge is not None:
