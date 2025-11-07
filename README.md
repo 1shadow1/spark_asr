@@ -144,6 +144,7 @@ python f:\work\singa\spark_asr\sauc_websocket_demo.py --file f:\data\audio\test.
   - `DIALOG_AUTOF_FLUSH_LEN`：无标点时的自动提交长度阈值（默认：`12`）
   - `DIALOG_SOFT_FLUSH_LEN`：软标点提前提交的最小长度（默认：`20`）
   - `DIALOG_ENABLE_SOFT_SUBMIT`：是否启用软标点提前提交（默认：`true`）
+  - `DIALOG_SILENCE_FLUSH_MS`：静默自动提交阈值（毫秒，默认：`1200`）。当识别文本在该时间内没有增长，视为一句话结束并提交。
 - 行为说明：
   - ASR 识别文本按强标点自然断句提交到对话后端；若无强标点但达到软阈值，会按软标点在尾部切分提交；再无则按长度阈值兜底提交。
   - SSE 回复解析出纯文本后，先在服务端按上述策略组句，再以 `type=dialog` 的增量消息推送到前端；结束时发送一次 `stream=false` 的最终汇总。
@@ -166,7 +167,8 @@ curl -N -X POST "http://0.0.0.0:8084/chat/stream" \
 - `APP_KEY` / `ACCESS_KEY`：凭据（必填）
 - `RESOURCE_ID`：资源 ID（如 `volc.bigasr.sauc.duration`）
 - `DIALOG_URL` / `DIALOG_MODE` / `VOICE_ID` / `SYSTEM_PROMPT`：对话后端配置
-- `DIALOG_PUNCT_STRONG` / `DIALOG_PUNCT_SOFT` / `DIALOG_AUTOF_FLUSH_LEN` / `DIALOG_SOFT_FLUSH_LEN` / `DIALOG_ENABLE_SOFT_SUBMIT`：断句与流式提交控制
+- `DIALOG_PUNCT_STRONG` / `DIALOG_PUNCT_SOFT` / `DIALOG_AUTOF_FLUSH_LEN` / `DIALOG_SOFT_FLUSH_LEN` / `DIALOG_ENABLE_SOFT_SUBMIT` / `DIALOG_SILENCE_FLUSH_MS`：断句与流式提交控制
+ - 仅符号文本过滤：当识别/尾部分割仅包含标点或空白时，不提交到对话后端（包含中文、字母或数字视为有效文本）。
  - `RESULT_DEDUP` / `RESULT_MIN_DELTA` / `RESULT_DEBOUNCE_MS`：ASR 增量去重与节流（减少重复文本）
 
 说明：服务启动时自动加载 `.env`；前端可用查询参数临时覆盖（仅联调用）。

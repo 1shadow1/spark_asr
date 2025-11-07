@@ -681,6 +681,8 @@ class DialogBridge:
         self.soft_punct = (soft_punct or default_soft)
         self.re_strong = re.compile("[" + re.escape(self.strong_punct) + "]+")
         self.re_soft = re.compile("[" + re.escape(self.soft_punct) + "]+")
+        # 有效文本判定：包含中文或字母数字视为有效；仅符号/空白视为无效
+        self.re_effective = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
         self.retry_max = 2
         self.usage_tokens = 0
         self.dialog_log_path = os.path.join(session_dir, 'dialog_events.jsonl')
@@ -703,6 +705,22 @@ class DialogBridge:
             self.enable_soft_submit = v in ("1", "true", "yes", "y")
         else:
             self.enable_soft_submit = bool(enable_soft_submit)
+
+        # 新增：静默自动提交阈值（毫秒）。当识别文本在该时间内没有增长，视为一句话结束，触发提交。
+        # 配置来源：环境变量 DIALOG_SILENCE_FLUSH_MS；默认 1200ms
+        try:
+            self.silence_flush_ms = int(os.getenv("DIALOG_SILENCE_FLUSH_MS", "1200"))
+        except Exception:
+            self.silence_flush_ms = 1200
+        # 运行时状态：最近文本增长时间戳（毫秒）、最近缓冲长度、提交并发锁与静默监控任务
+        self._last_growth_ts_ms = int(datetime.now().timestamp() * 1000)
+        self._last_buffer_len = 0
+        self._submit_lock = asyncio.Lock()
+        # 启动静默监控任务（后台周期检查）
+        try:
+            self._silence_task = asyncio.create_task(self._silence_watchdog())
+        except Exception:
+            self._silence_task = None
 
         # 语音克隆 TTS 配置与前端音频日志
         # 说明：当启用语音克隆时，我们会在每个 reply 段（stream=true）与最终回复（stream=false）
@@ -796,13 +814,23 @@ class DialogBridge:
         self.buffer = text
         # 找到未发送区间
         unsent = self.buffer[self.last_sent_index:]
+        # 记录文本增长：当缓冲长度增加时更新增长时间戳，用于静默判断
+        try:
+            cur_len = len(self.buffer)
+            if cur_len > self._last_buffer_len:
+                self._last_buffer_len = cur_len
+                self._last_growth_ts_ms = int(datetime.now().timestamp() * 1000)
+        except Exception:
+            pass
         if not unsent and not is_final:
             return
 
         sentences = self._split_complete_sentences(unsent)
-        # 逐句提交（强/软标点拆分）
+        # 逐句提交（强/软标点拆分）；若仅符号文本则不提交但消费掉
         for s in sentences:
-            await self._submit_to_dialog(s)
+            if self._is_effective_text(s):
+                await self._submit_to_dialog(s)
+            # 无论是否提交，均前移边界避免阻塞后续文本
             self.last_sent_index += len(s)
 
         # 若无标点拆分但文本已达到长度阈值，自动提交一次以便对话及时响应
@@ -811,20 +839,78 @@ class DialogBridge:
             if self.enable_soft_submit and len(unsent) >= self.soft_flush_min_chars:
                 soft_seg = self._split_soft_tail(unsent)
                 if soft_seg:
-                    await self._submit_to_dialog(soft_seg)
+                    if self._is_effective_text(soft_seg):
+                        await self._submit_to_dialog(soft_seg)
+                    # 无论是否提交，均消费掉该分片
                     self.last_sent_index += len(soft_seg)
             # 兜底：长度达到自动提交阈值或最终包
             tail_candidate = unsent.strip()
             if tail_candidate and (is_final or len(tail_candidate) >= self.autoflush_min_chars):
-                await self._submit_to_dialog(tail_candidate)
+                if self._is_effective_text(tail_candidate):
+                    await self._submit_to_dialog(tail_candidate)
+                # 消费尾部候选
                 self.last_sent_index = len(self.buffer)
 
         # 最终包时提交尾部非完整句
         if is_final:
             tail = self.buffer[self.last_sent_index:].strip()
             if tail:
-                await self._submit_to_dialog(tail)
+                if self._is_effective_text(tail):
+                    await self._submit_to_dialog(tail)
                 self.last_sent_index = len(self.buffer)
+
+    async def _silence_watchdog(self):
+        """
+        静默监控任务：周期性检查识别文本是否在一段时间内没有增长。
+        输入：无（使用实例状态）
+        输出：当超过静默阈值且存在未提交文本时，自动提交尾部文本。
+        逻辑：
+        - 若 `DIALOG_SILENCE_FLUSH_MS` <= 0，则不启用该机制
+        - 每 200ms 检查一次当前时间与 `self._last_growth_ts_ms` 的差值
+        - 若差值超过阈值，且 `buffer[last_sent_index:]` 非空，则将尾部视为一句话提交
+        - 使用提交锁避免与正常断句提交并发
+        """
+        if (self.silence_flush_ms or 0) <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(0.2)
+                # 前端可能已关闭；若 WS 已关闭则结束监控
+                if self.frontend_ws.closed:
+                    break
+                # 读取尾部未提交文本
+                tail = None
+                try:
+                    tail = self.buffer[self.last_sent_index:].strip()
+                except Exception:
+                    tail = ""
+                if not tail:
+                    continue
+                # 判断是否超过静默阈值
+                now_ms = int(datetime.now().timestamp() * 1000)
+                if (now_ms - self._last_growth_ts_ms) < self.silence_flush_ms:
+                    continue
+                # 触发一次提交（加锁避免与正常 on_recognition_update 并发冲突）
+                async with self._submit_lock:
+                    # 再次读取尾部（锁内）并提交
+                    tail2 = self.buffer[self.last_sent_index:].strip()
+                    if not tail2:
+                        continue
+                    # 若仅符号文本则不提交，仅消费并重置时间戳
+                    if not self._is_effective_text(tail2):
+                        self.last_sent_index = len(self.buffer)
+                        self._last_growth_ts_ms = now_ms
+                        continue
+                    try:
+                        await self._submit_to_dialog(tail2)
+                        self.last_sent_index = len(self.buffer)
+                        # 重置增长时间戳，避免重复提交
+                        self._last_growth_ts_ms = now_ms
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            # 任务被取消，正常退出
+            return
 
     def _split_complete_sentences(self, text: str):
         """
@@ -864,6 +950,26 @@ class DialogBridge:
         seg = text[:end]
         return seg.strip()
 
+    def _is_effective_text(self, s: str) -> bool:
+        """
+        判定文本是否有效（用于提交到对话后端的过滤）。
+        输入：s 待判定的字符串
+        输出：True/False —— True 表示包含中文或字母数字；False 表示仅为空白/标点/符号
+        设计原则：
+        - 若文本仅由空格、制表符或标点组成，则视为无效，不提交到对话服务
+        - 只要包含任意中文字符（\u4e00-\u9fff）或英文字母/数字，即视为有效
+        """
+        if not s:
+            return False
+        s2 = s.strip()
+        if not s2:
+            return False
+        try:
+            return bool(self.re_effective.search(s2))
+        except Exception:
+            # 兼容兜底：出现异常时按非空处理
+            return True
+
     async def _submit_to_dialog(self, sentence: str):
         """
         提交一句用户输入到对话后端，并将响应转发给前端。
@@ -873,6 +979,9 @@ class DialogBridge:
         - json：原有非流式 JSON 接口
         - sse：流式 SSE 接口（Accept: text/event-stream），逐块解析 data: 行
         """
+        # 过滤：若文本仅包含符号或空白，则不提交
+        if not self._is_effective_text(sentence or ""):
+            return
         event = {"type": "dialog_submit", "t": datetime.now().isoformat(), "payload": {"sentence": sentence, "mode": self.dialog_mode}}
         self._append_dialog_log(event)
 
@@ -1052,7 +1161,8 @@ class DialogBridge:
     async def _flush_remaining(self):
         tail = self.buffer[self.last_sent_index:].strip()
         if tail:
-            await self._submit_to_dialog(tail)
+            if self._is_effective_text(tail):
+                await self._submit_to_dialog(tail)
             self.last_sent_index = len(self.buffer)
 
     def _record_usage(self, usage: dict):
@@ -1444,6 +1554,12 @@ class DialogBridge:
         # 可在此做资源清理或汇总
         summary = {"type": "dialog_summary", "t": datetime.now().isoformat(), "usage_tokens": self.usage_tokens}
         self._append_dialog_log(summary)
+        # 取消静默监控任务
+        try:
+            if getattr(self, "_silence_task", None):
+                self._silence_task.cancel()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     import argparse
