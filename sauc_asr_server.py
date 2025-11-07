@@ -681,6 +681,8 @@ class DialogBridge:
         self.soft_punct = (soft_punct or default_soft)
         self.re_strong = re.compile("[" + re.escape(self.strong_punct) + "]+")
         self.re_soft = re.compile("[" + re.escape(self.soft_punct) + "]+")
+        # 有效文本判定：包含中文或字母数字视为有效；仅符号/空白视为无效
+        self.re_effective = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
         self.retry_max = 2
         self.usage_tokens = 0
         self.dialog_log_path = os.path.join(session_dir, 'dialog_events.jsonl')
@@ -824,9 +826,11 @@ class DialogBridge:
             return
 
         sentences = self._split_complete_sentences(unsent)
-        # 逐句提交（强/软标点拆分）
+        # 逐句提交（强/软标点拆分）；若仅符号文本则不提交但消费掉
         for s in sentences:
-            await self._submit_to_dialog(s)
+            if self._is_effective_text(s):
+                await self._submit_to_dialog(s)
+            # 无论是否提交，均前移边界避免阻塞后续文本
             self.last_sent_index += len(s)
 
         # 若无标点拆分但文本已达到长度阈值，自动提交一次以便对话及时响应
@@ -835,19 +839,24 @@ class DialogBridge:
             if self.enable_soft_submit and len(unsent) >= self.soft_flush_min_chars:
                 soft_seg = self._split_soft_tail(unsent)
                 if soft_seg:
-                    await self._submit_to_dialog(soft_seg)
+                    if self._is_effective_text(soft_seg):
+                        await self._submit_to_dialog(soft_seg)
+                    # 无论是否提交，均消费掉该分片
                     self.last_sent_index += len(soft_seg)
             # 兜底：长度达到自动提交阈值或最终包
             tail_candidate = unsent.strip()
             if tail_candidate and (is_final or len(tail_candidate) >= self.autoflush_min_chars):
-                await self._submit_to_dialog(tail_candidate)
+                if self._is_effective_text(tail_candidate):
+                    await self._submit_to_dialog(tail_candidate)
+                # 消费尾部候选
                 self.last_sent_index = len(self.buffer)
 
         # 最终包时提交尾部非完整句
         if is_final:
             tail = self.buffer[self.last_sent_index:].strip()
             if tail:
-                await self._submit_to_dialog(tail)
+                if self._is_effective_text(tail):
+                    await self._submit_to_dialog(tail)
                 self.last_sent_index = len(self.buffer)
 
     async def _silence_watchdog(self):
@@ -886,6 +895,11 @@ class DialogBridge:
                     # 再次读取尾部（锁内）并提交
                     tail2 = self.buffer[self.last_sent_index:].strip()
                     if not tail2:
+                        continue
+                    # 若仅符号文本则不提交，仅消费并重置时间戳
+                    if not self._is_effective_text(tail2):
+                        self.last_sent_index = len(self.buffer)
+                        self._last_growth_ts_ms = now_ms
                         continue
                     try:
                         await self._submit_to_dialog(tail2)
@@ -936,6 +950,26 @@ class DialogBridge:
         seg = text[:end]
         return seg.strip()
 
+    def _is_effective_text(self, s: str) -> bool:
+        """
+        判定文本是否有效（用于提交到对话后端的过滤）。
+        输入：s 待判定的字符串
+        输出：True/False —— True 表示包含中文或字母数字；False 表示仅为空白/标点/符号
+        设计原则：
+        - 若文本仅由空格、制表符或标点组成，则视为无效，不提交到对话服务
+        - 只要包含任意中文字符（\u4e00-\u9fff）或英文字母/数字，即视为有效
+        """
+        if not s:
+            return False
+        s2 = s.strip()
+        if not s2:
+            return False
+        try:
+            return bool(self.re_effective.search(s2))
+        except Exception:
+            # 兼容兜底：出现异常时按非空处理
+            return True
+
     async def _submit_to_dialog(self, sentence: str):
         """
         提交一句用户输入到对话后端，并将响应转发给前端。
@@ -945,6 +979,9 @@ class DialogBridge:
         - json：原有非流式 JSON 接口
         - sse：流式 SSE 接口（Accept: text/event-stream），逐块解析 data: 行
         """
+        # 过滤：若文本仅包含符号或空白，则不提交
+        if not self._is_effective_text(sentence or ""):
+            return
         event = {"type": "dialog_submit", "t": datetime.now().isoformat(), "payload": {"sentence": sentence, "mode": self.dialog_mode}}
         self._append_dialog_log(event)
 
@@ -1124,7 +1161,8 @@ class DialogBridge:
     async def _flush_remaining(self):
         tail = self.buffer[self.last_sent_index:].strip()
         if tail:
-            await self._submit_to_dialog(tail)
+            if self._is_effective_text(tail):
+                await self._submit_to_dialog(tail)
             self.last_sent_index = len(self.buffer)
 
     def _record_usage(self, usage: dict):
